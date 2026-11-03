@@ -1,0 +1,92 @@
+# Person B pipeline: build and runtime security
+#
+# Task 1 (this file's first job): Dockerfile and IaC scanning.
+# Later tasks add jobs here: SCA, SBOM, image build + scan, signing, DAST.
+#
+# Rules (team handover):
+#   - Observe first, then block: every check runs in report mode for now.
+#     See the "GATE" comments for the switch that makes it fail the build.
+#   - Actions pinned by commit SHA, images pinned by digest, never by tag.
+#   - Least privilege: read only by default, each job asks for what it needs.
+
+name: Build Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel an older run of the same branch / PR when a new commit is pushed
+concurrency:
+  group: build-security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HADOLINT_IMAGE: hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
+  CHECKOV_IMAGE: bridgecrew/checkov:3.3.29@sha256:3cc125b5337717b7303dbddd4e79374c120687b5ff6a24f9abdad56b562469f3
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Task 1: Dockerfile linting (Hadolint) + IaC scanning (Checkov)
+  # Scans: Dockerfile, infrastructure/Dockerfile, terraform/, infrastructure/terraform/
+  # ---------------------------------------------------------------------------
+  iac_scan:
+    name: iac_scan (Hadolint + Checkov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # upload SARIF to the Security tab
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Hadolint (Dockerfile best practices)
+        # GATE: remove --no-fail and add --failure-threshold error to block the build.
+        run: |
+          mkdir -p reports
+          # Readable output in the job log
+          docker run --rm -v "$PWD:/src" -w /src "$HADOLINT_IMAGE" \
+            /bin/hadolint --no-fail Dockerfile infrastructure/Dockerfile
+          # SARIF for the Security tab
+          docker run --rm -v "$PWD:/src" -w /src "$HADOLINT_IMAGE" \
+            /bin/hadolint --no-fail -f sarif Dockerfile infrastructure/Dockerfile \
+            > reports/hadolint.sarif
+
+      - name: Checkov (Dockerfile, Terraform, secrets)
+        # GATE: remove --soft-fail (or use --soft-fail-on LOW,MEDIUM) to block the build.
+        # Writes reports/results_cli.txt and reports/results_sarif.sarif
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$CHECKOV_IMAGE" \
+            -d . --framework dockerfile,secrets,terraform \
+            -o cli -o sarif --output-file-path reports \
+            --soft-fail --quiet --compact
+          cat reports/results_cli.txt
+
+      - name: Upload Hadolint results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          sarif_file: reports/hadolint.sarif
+          category: hadolint
+
+      - name: Upload Checkov results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          sarif_file: reports/results_sarif.sarif
+          category: checkov
+
+      - name: Keep the reports as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: iac-scan-reports
+          path: reports/
+          retention-days: 30
