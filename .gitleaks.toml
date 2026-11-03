@@ -1,0 +1,17 @@
+# Gitleaks configuration for the DevSecOps project
+# Used by both the pre-commit hook and the CI pipeline.
+title = "Juice Shop DevSecOps gitleaks config"
+
+# Keep every default rule (AWS keys, private keys, JWTs, generic API keys...)
+[extend]
+useDefault = true
+
+# Test fixtures: fake tokens, TOTP secrets and passwords that the test suites need.
+# They are not real credentials, so scanning them only produces noise.
+# Real source code, config and seed data are still scanned.
+[[allowlists]]
+description = "Test fixtures (fake credentials used by unit, API and e2e tests)"
+paths = [
+  '''^test/''',
+  '''\.spec\.ts$''',
+]

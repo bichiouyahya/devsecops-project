@@ -40,12 +40,12 @@ jobs:
           gitleaks version
 
       - name: Scan Git history
-        # Observe mode: --exit-code 0 reports findings without failing the build.
-        # Switch to --exit-code 1 once the intended findings are in .gitleaksignore.
+        # Blocking mode: any secret not triaged in .gitleaksignore fails the build.
+        # Test fixtures are excluded in .gitleaks.toml.
         run: |
-          gitleaks git . --redact --verbose \
+          gitleaks git . --config .gitleaks.toml --redact --verbose \
             --report-format sarif --report-path gitleaks.sarif \
-            --exit-code 0
+            --exit-code 1
 
       - name: Upload report as artifact
         if: always()
