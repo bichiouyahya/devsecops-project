@@ -1,0 +1,1180 @@
+{
+  "version": "2.6.2",
+  "summary": {
+    "title": "OWASP Juice Shop",
+    "owner": "DevSecOps project team",
+    "description": "E-commerce web app with an Angular frontend, a Node.js / Express API, a SQLite database and a MarsDB NoSQL store, shipped as a Docker image. Deliberately vulnerable. Target of our DevSecOps pipeline. Each threat names the pipeline stage that detects it.",
+    "id": 0
+  },
+  "detail": {
+    "contributors": [
+      {
+        "name": "Yahya Bichiou"
+      },
+      {
+        "name": "Mohamed Amine Bettaieb"
+      }
+    ],
+    "diagrams": [
+      {
+        "id": 0,
+        "title": "Juice Shop architecture",
+        "diagramType": "STRIDE",
+        "placeholder": "",
+        "thumbnail": "./public/content/images/thumbnail.stride.jpg",
+        "version": "2.6.2",
+        "cells": [
+          {
+            "position": {
+              "x": 40,
+              "y": 90
+            },
+            "size": {
+              "width": 160,
+              "height": 80
+            },
+            "attrs": {
+              "text": {
+                "text": "Customer\n(browser)"
+              },
+              "body": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "strokeDasharray": ""
+              }
+            },
+            "visible": true,
+            "shape": "actor",
+            "id": "31b2b889-dad5-47e6-9a4e-042e8bae9b78",
+            "zIndex": 2,
+            "data": {
+              "type": "tm.Actor",
+              "name": "Customer\n(browser)",
+              "description": "Registered or anonymous shopper using the Angular single page app.",
+              "isTrustBoundary": false,
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "threats": [
+                {
+                  "id": "3df516fe-b854-49a0-ae9c-c9c9a39336e0",
+                  "number": 1,
+                  "title": "Weak passwords and no MFA by default",
+                  "type": "Spoofing",
+                  "severity": "Medium",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "Customer accounts accept weak passwords and MFA is optional, so accounts can be taken over by guessing or credential stuffing.\n\nDetected by pipeline stage: DAST (OWASP ZAP) + code review",
+                  "mitigation": "Enforce a password policy, check passwords against breached lists, encourage or require 2FA.",
+                  "new": false
+                },
+                {
+                  "id": "ed02cf04-f08a-4a7d-856e-bdd08a2a9f19",
+                  "number": 2,
+                  "title": "Customer can deny placing an order",
+                  "type": "Repudiation",
+                  "severity": "Low",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "Orders and payments are not tied to a tamper evident audit trail, so a customer can dispute an action and we cannot prove it.\n\nDetected by pipeline stage: Code review",
+                  "mitigation": "Log order and payment events with user id, timestamp and request id to an append only log.",
+                  "new": false
+                }
+              ],
+              "hasOpenThreats": true,
+              "providesAuthentication": false
+            }
+          },
+          {
+            "position": {
+              "x": 40,
+              "y": 320
+            },
+            "size": {
+              "width": 160,
+              "height": 80
+            },
+            "attrs": {
+              "text": {
+                "text": "Attacker"
+              },
+              "body": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "strokeDasharray": ""
+              }
+            },
+            "visible": true,
+            "shape": "actor",
+            "id": "1a7875b4-1b90-4464-bc1d-3ef7cb2e27fa",
+            "zIndex": 3,
+            "data": {
+              "type": "tm.Actor",
+              "name": "Attacker",
+              "description": "Anonymous internet user sending crafted requests directly to the API.",
+              "isTrustBoundary": false,
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "threats": [],
+              "hasOpenThreats": false,
+              "providesAuthentication": false
+            }
+          },
+          {
+            "position": {
+              "x": 40,
+              "y": 560
+            },
+            "size": {
+              "width": 160,
+              "height": 80
+            },
+            "attrs": {
+              "text": {
+                "text": "Google OAuth"
+              },
+              "body": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "strokeDasharray": ""
+              }
+            },
+            "visible": true,
+            "shape": "actor",
+            "id": "8bec9b76-fc78-4c62-a311-acc5840db150",
+            "zIndex": 4,
+            "data": {
+              "type": "tm.Actor",
+              "name": "Google OAuth",
+              "description": "External identity provider used for 'Log in with Google'.",
+              "isTrustBoundary": false,
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "threats": [
+                {
+                  "id": "ee6ef76b-cc58-41c5-af8e-5b8657b2576d",
+                  "number": 3,
+                  "title": "OAuth accounts get a predictable password",
+                  "type": "Spoofing",
+                  "severity": "High",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "Users created through OAuth get a local password derived from their email address, so anyone who knows the email can log in with the normal form.\n\nDetected by pipeline stage: SAST (Semgrep / CodeQL) + code review",
+                  "mitigation": "Do not create a local password for OAuth users, or generate a random one; validate the ID token server side.",
+                  "new": false
+                }
+              ],
+              "hasOpenThreats": true,
+              "providesAuthentication": true
+            }
+          },
+          {
+            "position": {
+              "x": 440,
+              "y": 280
+            },
+            "size": {
+              "width": 150,
+              "height": 150
+            },
+            "attrs": {
+              "text": {
+                "text": "Juice Shop API\n(Node.js / Express)"
+              },
+              "body": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "strokeDasharray": ""
+              }
+            },
+            "visible": true,
+            "shape": "process",
+            "id": "20404bd1-c1e2-4e32-8341-d0df7fb1d5d4",
+            "zIndex": 5,
+            "data": {
+              "type": "tm.Process",
+              "name": "Juice Shop API\n(Node.js / Express)",
+              "description": "Express server exposing the REST API and serving the Angular frontend. Runs in a Docker container.",
+              "isTrustBoundary": false,
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "threats": [
+                {
+                  "id": "76803ec0-2f52-47c8-ab60-d74ecfebf6ad",
+                  "number": 4,
+                  "title": "JWT forgery with a hardcoded signing key",
+                  "type": "Spoofing",
+                  "severity": "High",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "The RSA private key used to sign JWTs is hardcoded in lib/insecurity.ts. Anyone with the source can forge a token for any user, including the admin.\n\nDetected by pipeline stage: Secrets scan (Gitleaks, pre-commit) + SAST",
+                  "mitigation": "Move the key to a secret manager or environment secret, rotate it, and verify the algorithm on every token (reject 'none').",
+                  "new": false
+                },
+                {
+                  "id": "b4e977ec-ce50-44a8-bd03-f245aed402c5",
+                  "number": 5,
+                  "title": "IDOR on basket API",
+                  "type": "Elevation of privilege",
+                  "severity": "High",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "GET /rest/basket/:id returns any basket by id without checking it belongs to the logged in user.\n\nDetected by pipeline stage: Security unit tests",
+                  "mitigation": "Check ownership server side: the basket id must match the id in the user's token.",
+                  "new": false
+                },
+                {
+                  "id": "ca9cd09f-0bb9-4e7c-a242-f6fbbda8b892",
+                  "number": 6,
+                  "title": "Mass assignment on registration",
+                  "type": "Elevation of privilege",
+                  "severity": "High",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "POST /api/Users accepts a 'role' field, so a new user can register directly as admin.\n\nDetected by pipeline stage: Security unit tests + SAST",
+                  "mitigation": "Whitelist accepted fields on registration and always set the role server side.",
+                  "new": false
+                },
+                {
+                  "id": "556ed71a-e634-44e0-bff4-c3b50282dcba",
+                  "number": 7,
+                  "title": "No audit log of sensitive actions",
+                  "type": "Repudiation",
+                  "severity": "Medium",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "Admin actions, login failures and payment changes are not recorded in a protected log, so attacks cannot be traced.\n\nDetected by pipeline stage: Code review",
+                  "mitigation": "Structured security logging of authentication, authorization failures and admin actions, shipped to a central log store.",
+                  "new": false
+                },
+                {
+                  "id": "5ebcd845-480c-4a09-87a3-32580bbf755d",
+                  "number": 8,
+                  "title": "Vulnerable third party npm packages",
+                  "type": "Tampering",
+                  "severity": "High",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "The API depends on many npm packages, some with known CVEs. A vulnerable or compromised dependency runs with the app's privileges.\n\nDetected by pipeline stage: SCA (Trivy fs, npm audit, Dependabot) + SBOM (Syft)",
+                  "mitigation": "Keep dependencies updated, pin versions with the lockfile, generate an SBOM, block builds with CRITICAL CVEs.",
+                  "new": false
+                },
+                {
+                  "id": "0f90481d-3473-40e3-bfa7-4b68aa663c00",
+                  "number": 9,
+                  "title": "Container image with excess privileges or vulnerable OS packages",
+                  "type": "Elevation of privilege",
+                  "severity": "Medium",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "If the container runs as root or the base image has known CVEs, an RCE in the app gives the attacker more control over the host.\n\nDetected by pipeline stage: Dockerfile scan (Hadolint, Checkov) + image scan (Trivy) + signing (Cosign)",
+                  "mitigation": "Run as a non-root USER, use a minimal base image, scan the image on every build, sign it.",
+                  "new": false
+                }
+              ],
+              "hasOpenThreats": true
+            }
+          },
+          {
+            "position": {
+              "x": 840,
+              "y": 70
+            },
+            "size": {
+              "width": 180,
+              "height": 80
+            },
+            "attrs": {
+              "text": {
+                "text": "SQLite database\n(users, products, baskets)"
+              },
+              "topLine": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "strokeDasharray": ""
+              },
+              "bottomLine": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "strokeDasharray": ""
+              }
+            },
+            "visible": true,
+            "shape": "store",
+            "id": "e97ef27c-f4f0-4f4e-b4cb-9a500275c566",
+            "zIndex": 6,
+            "data": {
+              "type": "tm.Store",
+              "name": "SQLite database\n(users, products, baskets)",
+              "description": "Relational database accessed through Sequelize and some raw SQL queries.",
+              "isTrustBoundary": false,
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "threats": [
+                {
+                  "id": "3c2093e3-9ea6-4aaf-8bc1-c3d6fc6938fa",
+                  "number": 10,
+                  "title": "Passwords stored as unsalted MD5",
+                  "type": "Information disclosure",
+                  "severity": "High",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "User passwords are hashed with MD5 and no salt. After any SQL injection dump they are cracked in seconds.\n\nDetected by pipeline stage: SAST (Semgrep / CodeQL)",
+                  "mitigation": "Hash passwords with bcrypt or Argon2 with a per user salt.",
+                  "new": false
+                },
+                {
+                  "id": "043a00cf-6ade-41ef-bb1f-cdc18d39734b",
+                  "number": 11,
+                  "title": "Database file not encrypted at rest",
+                  "type": "Information disclosure",
+                  "severity": "Low",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "The SQLite file sits unencrypted inside the container; anyone with access to the volume reads all data.\n\nDetected by pipeline stage: IaC / config review (Checkov)",
+                  "mitigation": "Encrypt the volume or move to a managed database with encryption at rest and least privilege accounts.",
+                  "new": false
+                }
+              ],
+              "hasOpenThreats": true,
+              "isALog": false,
+              "storesCredentials": true,
+              "isEncrypted": false,
+              "isSigned": false
+            }
+          },
+          {
+            "position": {
+              "x": 840,
+              "y": 320
+            },
+            "size": {
+              "width": 180,
+              "height": 80
+            },
+            "attrs": {
+              "text": {
+                "text": "MarsDB NoSQL\n(reviews, orders)"
+              },
+              "topLine": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "strokeDasharray": ""
+              },
+              "bottomLine": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "strokeDasharray": ""
+              }
+            },
+            "visible": true,
+            "shape": "store",
+            "id": "89e6fdd4-daa1-4a26-847f-292f01afa338",
+            "zIndex": 7,
+            "data": {
+              "type": "tm.Store",
+              "name": "MarsDB NoSQL\n(reviews, orders)",
+              "description": "In-memory MongoDB-like store for product reviews and orders.",
+              "isTrustBoundary": false,
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "threats": [
+                {
+                  "id": "3c093b4c-d34f-4be5-b1b5-1882b8ce442f",
+                  "number": 12,
+                  "title": "NoSQL injection modifies other users' reviews",
+                  "type": "Tampering",
+                  "severity": "High",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "PATCH /rest/products/reviews passes the request body straight into the update query, so operators like $ne update many reviews at once.\n\nDetected by pipeline stage: SAST (Semgrep / CodeQL)",
+                  "mitigation": "Validate types (id must be a string), never pass raw request objects to queries, update by exact id only.",
+                  "new": false
+                },
+                {
+                  "id": "39ef4a0a-2e0d-4fb5-9132-3adb5fc0e0df",
+                  "number": 13,
+                  "title": "NoSQL $where injection blocks the server",
+                  "type": "Denial of service",
+                  "severity": "Medium",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "The product review lookup builds a $where expression from user input, so a payload like sleep() freezes the event loop.\n\nDetected by pipeline stage: SAST (Semgrep / CodeQL) + DAST",
+                  "mitigation": "Remove $where queries, validate input, set query timeouts.",
+                  "new": false
+                },
+                {
+                  "id": "c23c60d8-ebea-4200-b89e-cbd079f5b032",
+                  "number": 14,
+                  "title": "Review posted under another user's name",
+                  "type": "Spoofing",
+                  "severity": "Medium",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "The review author is taken from the request body instead of the session, so a user can post as someone else.\n\nDetected by pipeline stage: Security unit tests",
+                  "mitigation": "Take the author from the authenticated token, ignore it in the body.",
+                  "new": false
+                }
+              ],
+              "hasOpenThreats": true,
+              "isALog": false,
+              "storesCredentials": false,
+              "isEncrypted": false,
+              "isSigned": false
+            }
+          },
+          {
+            "position": {
+              "x": 840,
+              "y": 570
+            },
+            "size": {
+              "width": 180,
+              "height": 80
+            },
+            "attrs": {
+              "text": {
+                "text": "File storage\n(/ftp, uploads)"
+              },
+              "topLine": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "strokeDasharray": ""
+              },
+              "bottomLine": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "strokeDasharray": ""
+              }
+            },
+            "visible": true,
+            "shape": "store",
+            "id": "0aa60402-02bb-4363-b75e-48e5bda64774",
+            "zIndex": 8,
+            "data": {
+              "type": "tm.Store",
+              "name": "File storage\n(/ftp, uploads)",
+              "description": "Server folders holding downloadable files (/ftp) and user uploads (complaints, profile images).",
+              "isTrustBoundary": false,
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "threats": [
+                {
+                  "id": "3a3f6bdf-c2d9-4732-82cd-fc4e2c3db4ca",
+                  "number": 15,
+                  "title": "/ftp folder exposes confidential files",
+                  "type": "Information disclosure",
+                  "severity": "High",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "The /ftp directory is browsable and contains internal documents and backup files such as package.json.bak.\n\nDetected by pipeline stage: DAST (OWASP ZAP)",
+                  "mitigation": "Remove sensitive files, disable directory listing, require authentication for internal documents.",
+                  "new": false
+                },
+                {
+                  "id": "45ec3179-b314-4a12-aa88-68a86a3c5d01",
+                  "number": 16,
+                  "title": "File type filter bypass with a poison null byte",
+                  "type": "Information disclosure",
+                  "severity": "Medium",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "The /ftp route only serves .md and .pdf, but an encoded null byte (%2500) bypasses the check and downloads any file.\n\nDetected by pipeline stage: DAST (OWASP ZAP) + SAST",
+                  "mitigation": "Normalize and decode the path before checking it, use an allow list of exact file names.",
+                  "new": false
+                },
+                {
+                  "id": "ea230962-846e-4678-8927-f8ea9af4839a",
+                  "number": 17,
+                  "title": "Unrestricted file upload",
+                  "type": "Tampering",
+                  "severity": "Medium",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "Upload size and type are only checked in the frontend, so crafted uploads (oversized files, XML with external entities) reach the server.\n\nDetected by pipeline stage: SAST + DAST",
+                  "mitigation": "Validate type, size and content server side, disable XML external entities in the parser.",
+                  "new": false
+                }
+              ],
+              "hasOpenThreats": true,
+              "isALog": false,
+              "storesCredentials": false,
+              "isEncrypted": false,
+              "isSigned": false
+            }
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": ""
+                },
+                "strokeDasharray": ""
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 9,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "HTTP requests\n(login, search, basket, upload, reviews)",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "protocol": "HTTP",
+              "isEncrypted": false,
+              "isPublicNetwork": true,
+              "isTrustBoundary": false,
+              "threats": [
+                {
+                  "id": "c82639fe-b2b6-4906-b6d6-3006a45528b4",
+                  "number": 18,
+                  "title": "SQL injection bypasses login",
+                  "type": "Spoofing",
+                  "severity": "High",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "routes/login.ts builds the SQL query by concatenating email and password, so ' OR 1=1-- logs in as the first user (admin).\n\nDetected by pipeline stage: SAST (Semgrep / CodeQL) + security unit tests",
+                  "mitigation": "Use parameterized queries (Sequelize replacements or the ORM), never string concatenation.",
+                  "new": false
+                },
+                {
+                  "id": "120802c0-a82f-4470-a44a-e4dfe587753c",
+                  "number": 19,
+                  "title": "SQL injection in product search dumps the database",
+                  "type": "Information disclosure",
+                  "severity": "High",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "routes/search.ts injects the q parameter into a raw query, so a UNION SELECT returns the whole Users table.\n\nDetected by pipeline stage: SAST (Semgrep / CodeQL) + DAST",
+                  "mitigation": "Parameterized query, input validation, least privilege database account.",
+                  "new": false
+                },
+                {
+                  "id": "11a80c89-94ba-4945-8ee6-c14c892fda6b",
+                  "number": 20,
+                  "title": "Brute force on login, no rate limiting",
+                  "type": "Spoofing",
+                  "severity": "Medium",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "The login endpoint has no rate limit or lockout, so passwords can be guessed at high speed.\n\nDetected by pipeline stage: DAST (OWASP ZAP)",
+                  "mitigation": "Rate limit by IP and account, progressive delays, lockout alerts.",
+                  "new": false
+                },
+                {
+                  "id": "e0665509-2f9d-4107-9c4c-5124df0c38ca",
+                  "number": 21,
+                  "title": "Traffic not protected by TLS",
+                  "type": "Information disclosure",
+                  "severity": "Medium",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "The app is served over plain HTTP, so credentials and tokens can be sniffed on the network.\n\nDetected by pipeline stage: DAST (OWASP ZAP)",
+                  "mitigation": "Terminate TLS in front of the app and send HSTS.",
+                  "new": false
+                }
+              ],
+              "hasOpenThreats": true
+            },
+            "id": "be921433-c095-458a-8bcd-7c7a5144de5f",
+            "labels": [
+              {
+                "position": 0.5,
+                "attrs": {
+                  "label": {
+                    "text": "HTTP requests\n(login, search, basket, upload, reviews)"
+                  }
+                }
+              }
+            ],
+            "source": {
+              "cell": "31b2b889-dad5-47e6-9a4e-042e8bae9b78"
+            },
+            "target": {
+              "cell": "20404bd1-c1e2-4e32-8341-d0df7fb1d5d4"
+            },
+            "vertices": [
+              {
+                "x": 320,
+                "y": 200
+              }
+            ]
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": ""
+                },
+                "strokeDasharray": ""
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "HTML, JSON, JWT token",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "protocol": "HTTP",
+              "isEncrypted": false,
+              "isPublicNetwork": true,
+              "isTrustBoundary": false,
+              "threats": [
+                {
+                  "id": "95153000-8e4f-4461-9e5c-d62a8adee8f2",
+                  "number": 22,
+                  "title": "Cross site scripting in search results",
+                  "type": "Tampering",
+                  "severity": "High",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "The frontend renders the search term with bypassSecurityTrustHtml, so injected script runs in the victim's browser and can steal the JWT from localStorage.\n\nDetected by pipeline stage: SAST (Semgrep / CodeQL) + DAST",
+                  "mitigation": "Never bypass Angular sanitization, encode output, add a strict Content Security Policy.",
+                  "new": false
+                },
+                {
+                  "id": "8a354696-9547-4ecd-87bc-2ceb2f6fa93b",
+                  "number": 23,
+                  "title": "Error responses leak stack traces",
+                  "type": "Information disclosure",
+                  "severity": "Medium",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "Unhandled errors return the full stack trace and framework details to the client.\n\nDetected by pipeline stage: DAST (OWASP ZAP) + security unit tests",
+                  "mitigation": "Generic error handler in production, log details server side only.",
+                  "new": false
+                },
+                {
+                  "id": "268d12d5-63ac-4d6f-a9ae-1e0d282426e6",
+                  "number": 24,
+                  "title": "Missing security headers",
+                  "type": "Information disclosure",
+                  "severity": "Low",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "Responses lack a Content Security Policy and other hardening headers.\n\nDetected by pipeline stage: DAST (OWASP ZAP)",
+                  "mitigation": "Add CSP, X-Content-Type-Options, Referrer-Policy and frame protections (helmet).",
+                  "new": false
+                }
+              ],
+              "hasOpenThreats": true
+            },
+            "id": "7a6f0a0e-e363-4af4-b63d-2b0b77834612",
+            "labels": [
+              {
+                "position": 0.5,
+                "attrs": {
+                  "label": {
+                    "text": "HTML, JSON, JWT token"
+                  }
+                }
+              }
+            ],
+            "source": {
+              "cell": "20404bd1-c1e2-4e32-8341-d0df7fb1d5d4"
+            },
+            "target": {
+              "cell": "31b2b889-dad5-47e6-9a4e-042e8bae9b78"
+            },
+            "vertices": [
+              {
+                "x": 320,
+                "y": 150
+              }
+            ]
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": ""
+                },
+                "strokeDasharray": ""
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 11,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Malicious requests",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "protocol": "HTTP",
+              "isEncrypted": false,
+              "isPublicNetwork": true,
+              "isTrustBoundary": false,
+              "threats": [
+                {
+                  "id": "a8cfe13d-dc51-4f28-97d8-f389dd8cd8c6",
+                  "number": 25,
+                  "title": "Normal user reaches the admin section",
+                  "type": "Elevation of privilege",
+                  "severity": "High",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "The administration page is only hidden by a frontend route guard; the API calls behind it accept any logged in user or are guessable.\n\nDetected by pipeline stage: DAST + security unit tests",
+                  "mitigation": "Enforce role checks on every admin API route server side.",
+                  "new": false
+                },
+                {
+                  "id": "9e63a206-3a55-4cb2-8b91-a384b0844015",
+                  "number": 26,
+                  "title": "No limit on request rate or size",
+                  "type": "Denial of service",
+                  "severity": "Medium",
+                  "status": "Open",
+                  "score": "",
+                  "modelType": "STRIDE",
+                  "description": "Any client can flood the API or send very large bodies, exhausting the single Node.js process.\n\nDetected by pipeline stage: DAST (OWASP ZAP)",
+                  "mitigation": "Rate limiting, body size limits, run several instances behind a load balancer.",
+                  "new": false
+                }
+              ],
+              "hasOpenThreats": true
+            },
+            "id": "86e8dd9a-249e-4365-912d-d39ccde72b2e",
+            "labels": [
+              {
+                "position": 0.5,
+                "attrs": {
+                  "label": {
+                    "text": "Malicious requests"
+                  }
+                }
+              }
+            ],
+            "source": {
+              "cell": "1a7875b4-1b90-4464-bc1d-3ef7cb2e27fa"
+            },
+            "target": {
+              "cell": "20404bd1-c1e2-4e32-8341-d0df7fb1d5d4"
+            },
+            "vertices": []
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": ""
+                },
+                "strokeDasharray": ""
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 12,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "OAuth login",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "protocol": "HTTPS",
+              "isEncrypted": true,
+              "isPublicNetwork": true,
+              "isTrustBoundary": false,
+              "threats": [],
+              "hasOpenThreats": false
+            },
+            "id": "2c8713ba-b7f0-4d89-a265-b2f509172c46",
+            "labels": [
+              {
+                "position": 0.5,
+                "attrs": {
+                  "label": {
+                    "text": "OAuth login"
+                  }
+                }
+              }
+            ],
+            "source": {
+              "cell": "31b2b889-dad5-47e6-9a4e-042e8bae9b78"
+            },
+            "target": {
+              "cell": "8bec9b76-fc78-4c62-a311-acc5840db150"
+            },
+            "vertices": []
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": ""
+                },
+                "strokeDasharray": ""
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 13,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "SQL queries",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "protocol": "SQLite (local)",
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "isTrustBoundary": false,
+              "threats": [],
+              "hasOpenThreats": false
+            },
+            "id": "211a64b6-f945-4a88-a7e2-ca80427bd4d1",
+            "labels": [
+              {
+                "position": 0.5,
+                "attrs": {
+                  "label": {
+                    "text": "SQL queries"
+                  }
+                }
+              }
+            ],
+            "source": {
+              "cell": "20404bd1-c1e2-4e32-8341-d0df7fb1d5d4"
+            },
+            "target": {
+              "cell": "e97ef27c-f4f0-4f4e-b4cb-9a500275c566"
+            },
+            "vertices": [
+              {
+                "x": 720,
+                "y": 200
+              }
+            ]
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": ""
+                },
+                "strokeDasharray": ""
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 14,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Query results",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "protocol": "SQLite (local)",
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "isTrustBoundary": false,
+              "threats": [],
+              "hasOpenThreats": false
+            },
+            "id": "9baa1240-eb3f-4356-8ce9-bf7d7fa50166",
+            "labels": [
+              {
+                "position": 0.5,
+                "attrs": {
+                  "label": {
+                    "text": "Query results"
+                  }
+                }
+              }
+            ],
+            "source": {
+              "cell": "e97ef27c-f4f0-4f4e-b4cb-9a500275c566"
+            },
+            "target": {
+              "cell": "20404bd1-c1e2-4e32-8341-d0df7fb1d5d4"
+            },
+            "vertices": [
+              {
+                "x": 720,
+                "y": 160
+              }
+            ]
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": ""
+                },
+                "strokeDasharray": ""
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 15,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Review and order queries",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "protocol": "In-process",
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "isTrustBoundary": false,
+              "threats": [],
+              "hasOpenThreats": false
+            },
+            "id": "f2a32193-b87d-49aa-82d4-12a3142b93a9",
+            "labels": [
+              {
+                "position": 0.5,
+                "attrs": {
+                  "label": {
+                    "text": "Review and order queries"
+                  }
+                }
+              }
+            ],
+            "source": {
+              "cell": "20404bd1-c1e2-4e32-8341-d0df7fb1d5d4"
+            },
+            "target": {
+              "cell": "89e6fdd4-daa1-4a26-847f-292f01afa338"
+            },
+            "vertices": []
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": ""
+                },
+                "strokeDasharray": ""
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 16,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Read and write files",
+              "description": "",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "protocol": "Filesystem",
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "isTrustBoundary": false,
+              "threats": [],
+              "hasOpenThreats": false
+            },
+            "id": "4e90428e-32cf-45ad-a640-8c536fc622bd",
+            "labels": [
+              {
+                "position": 0.5,
+                "attrs": {
+                  "label": {
+                    "text": "Read and write files"
+                  }
+                }
+              }
+            ],
+            "source": {
+              "cell": "20404bd1-c1e2-4e32-8341-d0df7fb1d5d4"
+            },
+            "target": {
+              "cell": "0aa60402-02bb-4363-b75e-48e5bda64774"
+            },
+            "vertices": [
+              {
+                "x": 720,
+                "y": 520
+              }
+            ]
+          },
+          {
+            "shape": "trust-boundary-curve",
+            "attrs": {
+              "line": {
+                "targetMarker": {
+                  "name": ""
+                },
+                "sourceMarker": {
+                  "name": ""
+                }
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 17,
+            "connector": "smooth",
+            "labels": [
+              {
+                "position": 0.5,
+                "attrs": {
+                  "label": {
+                    "text": "Internet trust boundary"
+                  }
+                }
+              }
+            ],
+            "data": {
+              "type": "tm.Boundary",
+              "name": "Internet trust boundary",
+              "description": "",
+              "isTrustBoundary": true,
+              "hasOpenThreats": false
+            },
+            "id": "3b09e2fa-419b-42ce-bb58-5b2b4188b30d",
+            "source": {
+              "x": 310,
+              "y": 20
+            },
+            "target": {
+              "x": 310,
+              "y": 690
+            },
+            "vertices": [
+              {
+                "x": 330,
+                "y": 355
+              }
+            ]
+          },
+          {
+            "shape": "trust-boundary-curve",
+            "attrs": {
+              "line": {
+                "targetMarker": {
+                  "name": ""
+                },
+                "sourceMarker": {
+                  "name": ""
+                }
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 18,
+            "connector": "smooth",
+            "labels": [
+              {
+                "position": 0.5,
+                "attrs": {
+                  "label": {
+                    "text": "Data trust boundary"
+                  }
+                }
+              }
+            ],
+            "data": {
+              "type": "tm.Boundary",
+              "name": "Data trust boundary",
+              "description": "",
+              "isTrustBoundary": true,
+              "hasOpenThreats": false
+            },
+            "id": "decb05d0-7d92-4239-8b7c-ba51a6051e5c",
+            "source": {
+              "x": 740,
+              "y": 20
+            },
+            "target": {
+              "x": 740,
+              "y": 690
+            },
+            "vertices": [
+              {
+                "x": 760,
+                "y": 355
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "diagramTop": 1,
+    "reviewer": "",
+    "threatTop": 26
+  }
+}
