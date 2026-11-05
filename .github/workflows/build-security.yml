@@ -4,7 +4,8 @@
 #   iac_scan  Task 1: Dockerfile and IaC scanning (Hadolint, Checkov)
 #   sca       Task 2: vulnerable dependencies (Trivy, npm audit)
 #   sbom      Task 3: software bill of materials (Syft, CycloneDX)
-# Later tasks add: image build + scan, signing, DAST.
+#   image     Task 4: build the container image, scan it (Trivy), push to GHCR
+# Later tasks add: signing, DAST.
 #
 # Rules (team handover):
 #   - Observe first, then block: every check runs in report mode for now.
@@ -33,6 +34,8 @@ env:
   CHECKOV_IMAGE: bridgecrew/checkov:3.3.29@sha256:3cc125b5337717b7303dbddd4e79374c120687b5ff6a24f9abdad56b562469f3
   TRIVY_IMAGE: aquasec/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222
   SYFT_IMAGE: anchore/syft:v1.55.0@sha256:4cc92b64ca74ffca4c94d4c8fcc01f217731375300be14d0b6eeb2e82eaa110a
+  # Our own image in GitHub Container Registry (repository name is lowercase)
+  APP_IMAGE: ghcr.io/${{ github.repository }}/juice-shop
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -235,3 +238,94 @@ jobs:
           name: sbom
           path: sbom.cdx.json
           retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Task 4: container build, image scan, push to GitHub Container Registry
+  #
+  # The image adds OS packages and layers that the source scan cannot see.
+  # Order: build -> scan -> push, so that once the gate is on, a vulnerable
+  # image never reaches the registry. Tagged with the commit SHA (traceable,
+  # never overwritten); the digest is exported for signing (Task 5).
+  # ---------------------------------------------------------------------------
+  image:
+    name: image (build, Trivy scan, push to GHCR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io with the job's own short-lived token
+      security-events: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build image (tagged with the commit SHA)
+        # Full Juice Shop build (backend + Angular frontend): about 10 minutes.
+        run: |
+          docker build \
+            --build-arg VCS_REF="$GITHUB_SHA" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "$APP_IMAGE:$GITHUB_SHA" .
+          docker image ls "$APP_IMAGE"
+
+      - name: Trivy image scan (HIGH, CRITICAL)
+        # The image is exported to a tar file and scanned offline, so Trivy
+        # never gets access to the Docker socket (that would be root on the runner).
+        # GATE: change --exit-code 0 to --exit-code 1 in the table step
+        # (with --severity CRITICAL --ignore-unfixed) to stop before the push.
+        run: |
+          mkdir -p reports "$RUNNER_TEMP/trivy-cache"
+          docker save "$APP_IMAGE:$GITHUB_SHA" -o "$RUNNER_TEMP/image.tar"
+          trivy() {
+            docker run --rm -v "$PWD:/src" -w /src \
+              -v "$RUNNER_TEMP:/scan:ro" \
+              -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+              "$TRIVY_IMAGE" "$@"
+          }
+          # Readable table in the job log
+          trivy image --input /scan/image.tar --scanners vuln \
+            --severity HIGH,CRITICAL --format table --exit-code 0
+          # SARIF for the Security tab, JSON (all severities) for the report
+          trivy image --input /scan/image.tar --scanners vuln --skip-db-update \
+            --severity HIGH,CRITICAL --format sarif --output reports/trivy-image.sarif
+          trivy image --input /scan/image.tar --scanners vuln --skip-db-update \
+            --format json --output reports/trivy-image.json
+          rm -f "$RUNNER_TEMP/image.tar"
+
+      - name: Push image to GHCR
+        id: push
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          docker push "$APP_IMAGE:$GITHUB_SHA"
+          # The digest identifies the exact image content; Task 5 signs this, not the tag
+          ref=$(docker inspect --format='{{index .RepoDigests 0}}' "$APP_IMAGE:$GITHUB_SHA")
+          digest="${ref#*@}"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Image pushed"
+            echo "- Tag: \`$APP_IMAGE:$GITHUB_SHA\`"
+            echo "- Digest: \`$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          docker logout ghcr.io
+
+      - name: Upload Trivy results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          sarif_file: reports/trivy-image.sarif
+          category: trivy-image
+
+      - name: Keep the image scan reports as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-scan-reports
+          path: reports/
+          retention-days: 30
