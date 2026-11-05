@@ -3,7 +3,8 @@
 # Jobs:
 #   iac_scan  Task 1: Dockerfile and IaC scanning (Hadolint, Checkov)
 #   sca       Task 2: vulnerable dependencies (Trivy, npm audit)
-# Later tasks add: SBOM, image build + scan, signing, DAST.
+#   sbom      Task 3: software bill of materials (Syft, CycloneDX)
+# Later tasks add: image build + scan, signing, DAST.
 #
 # Rules (team handover):
 #   - Observe first, then block: every check runs in report mode for now.
@@ -31,6 +32,7 @@ env:
   HADOLINT_IMAGE: hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
   CHECKOV_IMAGE: bridgecrew/checkov:3.3.29@sha256:3cc125b5337717b7303dbddd4e79374c120687b5ff6a24f9abdad56b562469f3
   TRIVY_IMAGE: aquasec/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222
+  SYFT_IMAGE: anchore/syft:v1.55.0@sha256:4cc92b64ca74ffca4c94d4c8fcc01f217731375300be14d0b6eeb2e82eaa110a
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -179,3 +181,57 @@ jobs:
             package-lock.json
             frontend/package-lock.json
           retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Task 3: SBOM, inventory of every component (Syft, CycloneDX JSON)
+  #
+  # Same lockfile step as the sca job: without it Syft only sees 4 components
+  # (the GitHub Actions in the workflow files) instead of ~1,170 npm packages.
+  # ---------------------------------------------------------------------------
+  sbom:
+    name: sbom (Syft, CycloneDX)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Resolve dependency tree (generate lockfiles, no install)
+        run: |
+          npm install --package-lock-only --package-lock=true \
+            --ignore-scripts --no-audit --no-fund
+          cd frontend
+          npm install --package-lock-only --package-lock=true \
+            --ignore-scripts --no-audit --no-fund --legacy-peer-deps
+
+      - name: Generate SBOM with Syft
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$SYFT_IMAGE" \
+            dir:. --source-name juice-shop --source-version "$GITHUB_SHA" \
+            -o cyclonedx-json=sbom.cdx.json
+          echo "Components in the SBOM:"
+          jq '.components | length' sbom.cdx.json
+
+      - name: Scan the SBOM with Trivy (bonus)
+        # Vulnerability scan from the inventory alone, no source code needed.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" \
+            sbom --severity HIGH,CRITICAL --format table --exit-code 0 \
+            sbom.cdx.json
+
+      - name: Keep the SBOM as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          retention-days: 90
