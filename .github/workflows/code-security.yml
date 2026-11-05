@@ -1,4 +1,4 @@
-# Person A pipeline: code security (secrets now, SAST and tests added in later tasks)
+# Person A pipeline: code security (secrets, SAST; security tests added in Task 5)
 name: Code Security
 
 on:
@@ -13,6 +13,7 @@ permissions:
 
 env:
   GITLEAKS_VERSION: 8.30.1
+  SEMGREP_VERSION: 1.183.0
 
 jobs:
   secrets:
@@ -40,12 +41,12 @@ jobs:
           gitleaks version
 
       - name: Scan Git history
-        # Observe mode: --exit-code 0 reports findings without failing the build.
-        # Switch to --exit-code 1 once the intended findings are in .gitleaksignore.
+        # Blocking mode: any secret not triaged in .gitleaksignore fails the build.
+        # Test fixtures are excluded in .gitleaks.toml.
         run: |
-          gitleaks git . --redact --verbose \
+          gitleaks git . --config .gitleaks.toml --redact --verbose \
             --report-format sarif --report-path gitleaks.sarif \
-            --exit-code 0
+            --exit-code 1
 
       - name: Upload report as artifact
         if: always()
@@ -60,3 +61,74 @@ jobs:
         with:
           sarif_file: gitleaks.sarif
           category: gitleaks
+
+  sast-semgrep:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Semgrep (pinned version)
+        run: |
+          pipx install "semgrep==${SEMGREP_VERSION}"
+          semgrep --version
+
+      - name: Scan source code
+        # Observe mode: Semgrep exits 0 without --error, so findings are reported, not blocking.
+        # Blocking mode (after triage): add  --error --severity ERROR
+        run: |
+          semgrep scan \
+            --config p/javascript \
+            --config p/typescript \
+            --config p/nodejsscan \
+            --config p/owasp-top-ten \
+            --metrics off \
+            --sarif --output semgrep.sarif \
+            --text-output semgrep.txt
+
+      - name: Show summary
+        if: always()
+        run: tail -n 40 semgrep.txt || true
+
+      - name: Upload report as artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: semgrep-report
+          path: |
+            semgrep.sarif
+            semgrep.txt
+
+      - name: Upload to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@bd01fe9e80db3cb1eb1368bd8f61d3eb5f43d1f4 # v4.39.2
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  sast-codeql:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@bd01fe9e80db3cb1eb1368bd8f61d3eb5f43d1f4 # v4.39.2
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          queries: security-extended   # broader security query suite
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@bd01fe9e80db3cb1eb1368bd8f61d3eb5f43d1f4 # v4.39.2
+        with:
+          category: codeql

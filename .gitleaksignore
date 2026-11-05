@@ -1,0 +1,12 @@
+# Triaged baseline of known secrets in OWASP Juice Shop (from the upstream import).
+# Seed data: data/static/users.yml
+# Deliberate vulnerabilities tracked in docs/threat-model: lib/insecurity.ts, routes/login.ts, terraform networking.tf
+# False positive: faucet.component.ts (public contract address)
+# Any NEW secret not listed here fails the pipeline.
+69e09603b5f2baab076c3ce019fc26c63d250a18:data/static/users.yml:generic-api-key:88
+69e09603b5f2baab076c3ce019fc26c63d250a18:data/static/users.yml:generic-api-key:151
+69e09603b5f2baab076c3ce019fc26c63d250a18:frontend/src/app/faucet/faucet.component.ts:generic-api-key:34
+69e09603b5f2baab076c3ce019fc26c63d250a18:lib/insecurity.ts:private-key:21
+69e09603b5f2baab076c3ce019fc26c63d250a18:infrastructure/terraform/networking.tf:private-key:171
+69e09603b5f2baab076c3ce019fc26c63d250a18:routes/login.ts:generic-api-key:64
+69e09603b5f2baab076c3ce019fc26c63d250a18:terraform/networking.tf:private-key:171
