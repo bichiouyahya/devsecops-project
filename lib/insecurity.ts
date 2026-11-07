@@ -49,36 +49,31 @@ export const cutOffPoisonNullByte = (str: string) => {
   return str
 }
 
-// FIX (DevSecOps Task 7): pin the JWT algorithm.
-// The old express-jwt / jsonwebtoken versions trust the "alg" field of the token header,
-// so a token with alg "none" and no signature was accepted. We only ever sign with RS256,
-// so any token announcing another algorithm is rejected before it reaches the library.
-const EXPECTED_JWT_ALGORITHM = 'RS256'
-
-export const hasExpectedAlgorithm = (token: string | undefined): boolean => {
-  if (!token) return false
+// FIX (DevSecOps Task 7): verify JWT signatures with a fixed algorithm (RS256).
+// The old express-jwt / jsonwebtoken / jws versions read the algorithm from the token header,
+// so a token announcing alg "none" with no signature was accepted. We only ever sign with RS256,
+// so tokens are now verified with RS256 directly and the header's "alg" claim is never trusted.
+export const hasValidSignature = (token: string): boolean => {
+  const [header, payload, signature] = String(token).split('.')
   try {
-    const header = JSON.parse(Buffer.from(token.split('.')[0], 'base64url').toString('utf8'))
-    return header?.alg === EXPECTED_JWT_ALGORITHM
+    return crypto.verify('RSA-SHA256', Buffer.from(`${header}.${payload}`), publicKey, Buffer.from(signature ?? '', 'base64url'))
   } catch {
     return false
   }
 }
 
 export const isAuthorized = () => {
-  const verifyJwt = expressJwt(({ secret: publicKey }) as any)
+  const checkClaims = expressJwt(({ secret: publicKey }) as any)
   return (req: Request, res: Response, next: NextFunction) => {
-    const token = utils.jwtFrom(req)
-    if (token && !hasExpectedAlgorithm(token)) {
-      next(Object.assign(new Error(`Only ${EXPECTED_JWT_ALGORITHM} signed tokens are accepted`), { name: 'UnauthorizedError', code: 'invalid_token', status: 401 }))
-      return
-    }
-    verifyJwt(req, res, next)
+    const signatureValid = hasValidSignature(utils.jwtFrom(req) ?? '')
+    checkClaims(req, res, (err?: any) => {
+      next(err ?? (signatureValid ? undefined : Object.assign(new Error('Invalid token signature'), { name: 'UnauthorizedError', code: 'invalid_token', status: 401 })))
+    })
   }
 }
 export const denyAll = () => expressJwt({ secret: '' + Math.random() } as any)
 export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256' })
-export const verify = (token: string) => token && hasExpectedAlgorithm(token) ? (jws.verify as ((token: string, secret: string) => boolean))(token, publicKey) : false
+export const verify = (token: string) => hasValidSignature(token)
 export const decode = (token: string) => { return jws.decode(token)?.payload }
 
 export const sanitizeHtml = (html: string) => sanitizeHtmlLib(html)
