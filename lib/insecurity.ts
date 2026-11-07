@@ -49,10 +49,36 @@ export const cutOffPoisonNullByte = (str: string) => {
   return str
 }
 
-export const isAuthorized = () => expressJwt(({ secret: publicKey }) as any)
+// FIX (DevSecOps Task 7): pin the JWT algorithm.
+// The old express-jwt / jsonwebtoken versions trust the "alg" field of the token header,
+// so a token with alg "none" and no signature was accepted. We only ever sign with RS256,
+// so any token announcing another algorithm is rejected before it reaches the library.
+const EXPECTED_JWT_ALGORITHM = 'RS256'
+
+export const hasExpectedAlgorithm = (token: string | undefined): boolean => {
+  if (!token) return false
+  try {
+    const header = JSON.parse(Buffer.from(token.split('.')[0], 'base64url').toString('utf8'))
+    return header?.alg === EXPECTED_JWT_ALGORITHM
+  } catch {
+    return false
+  }
+}
+
+export const isAuthorized = () => {
+  const verifyJwt = expressJwt(({ secret: publicKey }) as any)
+  return (req: Request, res: Response, next: NextFunction) => {
+    const token = utils.jwtFrom(req)
+    if (token && !hasExpectedAlgorithm(token)) {
+      next(Object.assign(new Error(`Only ${EXPECTED_JWT_ALGORITHM} signed tokens are accepted`), { name: 'UnauthorizedError', code: 'invalid_token', status: 401 }))
+      return
+    }
+    verifyJwt(req, res, next)
+  }
+}
 export const denyAll = () => expressJwt({ secret: '' + Math.random() } as any)
 export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256' })
-export const verify = (token: string) => token ? (jws.verify as ((token: string, secret: string) => boolean))(token, publicKey) : false
+export const verify = (token: string) => token && hasExpectedAlgorithm(token) ? (jws.verify as ((token: string, secret: string) => boolean))(token, publicKey) : false
 export const decode = (token: string) => { return jws.decode(token)?.payload }
 
 export const sanitizeHtml = (html: string) => sanitizeHtmlLib(html)
