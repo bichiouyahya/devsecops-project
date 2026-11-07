@@ -148,9 +148,25 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install and build (server and frontend)
-        # Juice Shop has no lockfile, so npm install (not npm ci). Its postinstall builds both apps.
-        run: npm install --no-audit --no-fund
+      - name: Install backend dependencies
+        # Juice Shop has no lockfile, so npm install (not npm ci).
+        # --ignore-scripts skips the postinstall that builds the Angular frontend:
+        # these API tests do not need the UI, and that build crashes npm on CI.
+        run: |
+          npm install --no-audit --no-fund --ignore-scripts
+          npm rebuild sqlite3
+
+      - name: Build server
+        run: npx tsc
+
+      - name: Create placeholder frontend files
+        # The server checks at startup that these files exist. API tests never load them.
+        run: |
+          d=frontend/dist/frontend
+          mkdir -p "$d"
+          for f in index.html styles.css main.js polyfills.js hacking-instructor-placeholder.js; do
+            echo "" > "$d/$f"
+          done
 
       - name: Run security tests
         # Observe mode: the tests prove the flaws exist, so they fail until the Task 7 fixes.
