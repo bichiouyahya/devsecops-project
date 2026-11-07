@@ -31,8 +31,8 @@ export function login () {
 
   return (req: Request, res: Response, next: NextFunction) => {
     verifyPreLoginChallenges(req) // vuln-code-snippet hide-line
-    // FIX (DevSecOps Task 7): parameterized query. User input is sent to the database as bound values,
-    // never concatenated into the SQL text, so it can no longer change the structure of the query.
+    // FIX (DevSecOps Task 7): parameterized query. User input is sent to the database as bound values, // vuln-code-snippet hide-line
+    // never concatenated into the SQL text, so it can no longer change the structure of the query. // vuln-code-snippet hide-line
     models.sequelize.query('SELECT * FROM Users WHERE email = $email AND password = $password AND deletedAt IS NULL', { // vuln-code-snippet vuln-line loginAdminChallenge loginBenderChallenge loginJimChallenge
       bind: {
         email: String(req.body.email ?? ''),
