@@ -230,5 +230,8 @@
     "esbuild@0.28.1": true,
     "@scarf/scarf": false,
     "cypress@15.17.0": true
+  },
+  "overrides": {
+    "crypto-js": "4.2.0"
   }
 }
