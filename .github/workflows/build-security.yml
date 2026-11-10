@@ -6,7 +6,7 @@
 #   sbom      Task 3: software bill of materials (Syft, CycloneDX)
 #   image     Task 4: build the container image, scan it (Trivy), push to GHCR
 #   sign      Task 5: sign the image by digest and verify it (Cosign)
-# Later tasks add: DAST.
+#   dast      Task 6: attack the running app with OWASP ZAP (baseline scan)
 #
 # Rules (team handover):
 #   - Observe first, then block: every check runs in report mode for now.
@@ -38,6 +38,7 @@ env:
   # Our own image in GitHub Container Registry (repository name is lowercase)
   APP_IMAGE: ghcr.io/${{ github.repository }}/juice-shop
   COSIGN_VERSION: v3.1.4
+  ZAP_IMAGE: ghcr.io/zaproxy/zaproxy:2.17.0@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -431,3 +432,82 @@ jobs:
       - name: Log out of GHCR
         if: always()
         run: docker logout ghcr.io
+
+  # ---------------------------------------------------------------------------
+  # Task 6: DAST, attack the running application with OWASP ZAP
+  #
+  # Finds what static tools cannot see: missing security headers, exposed
+  # paths, cookies, runtime error pages. Runs only after the image has been
+  # signed and verified, against that exact image (by digest).
+  #
+  # Baseline mode only (passive: spiders the app and inspects the responses,
+  # no attack payloads), and only against the container started inside this
+  # job on localhost. Never point this job at any other host.
+  # ---------------------------------------------------------------------------
+  dast:
+    name: dast (OWASP ZAP baseline)
+    needs: [image, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read # pull our image from GHCR
+    steps:
+      - name: Pull the signed image from GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          docker pull "$APP_IMAGE@$DIGEST"
+          docker logout ghcr.io
+
+      - name: Start Juice Shop and wait until it answers on port 3000
+        env:
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          docker run -d --name juice -p 127.0.0.1:3000:3000 "$APP_IMAGE@$DIGEST"
+          for i in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:3000; then
+              echo "Juice Shop is up after $((i * 2)) seconds"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Juice Shop did not start within 2 minutes"
+          docker logs juice
+          exit 1
+
+      - name: ZAP baseline scan
+        # Exit codes: 0 = no alerts, 1 = FAIL alerts, 2 = WARN alerts only, 3 = error.
+        # GATE: after tuning the rules, fail the build on exit code 1 (FAIL alerts).
+        run: |
+          mkdir -p zap && chmod 777 zap # the ZAP container runs as user "zap"
+          set +e
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk" "$ZAP_IMAGE" \
+            zap-baseline.py -t http://127.0.0.1:3000 \
+            -r zap-report.html -J zap-report.json -w zap-report.md -I
+          code=$?
+          set -e
+          echo "ZAP exit code: $code"
+          if [ "$code" -eq 3 ]; then
+            echo "::error::ZAP failed to run the scan"
+            exit 1
+          fi
+          {
+            echo "### ZAP baseline scan (exit code $code)"
+            cat zap/zap-report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop Juice Shop
+        if: always()
+        run: docker rm -f juice || true
+
+      - name: Keep the ZAP reports as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zap-reports
+          path: zap/
+          retention-days: 30
