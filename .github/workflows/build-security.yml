@@ -412,9 +412,17 @@ jobs:
       - name: Negative test, an image we did not sign must be rejected
         # The upstream Juice Shop image from Docker Hub was not signed with our key,
         # so verification has to fail. If it passed, the check would be worthless.
+        # It must fail for the RIGHT reason ("no signatures found"), not because of a
+        # network error or a registry rate limit, otherwise the test proves nothing.
         run: |
-          if cosign verify --key cosign.pub docker.io/bkimminich/juice-shop:latest; then
+          if out=$(cosign verify --key cosign.pub docker.io/bkimminich/juice-shop:latest 2>&1); then
+            echo "$out"
             echo "::error::An image that we did not sign passed verification"
+            exit 1
+          fi
+          echo "$out"
+          if ! grep -q "no signatures found" <<< "$out"; then
+            echo "::error::Verification failed for an unexpected reason (see the output above)"
             exit 1
           fi
           echo "As expected: the unsigned upstream image was rejected."
