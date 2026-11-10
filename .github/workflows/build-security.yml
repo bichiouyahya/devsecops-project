@@ -5,7 +5,8 @@
 #   sca       Task 2: vulnerable dependencies (Trivy, npm audit)
 #   sbom      Task 3: software bill of materials (Syft, CycloneDX)
 #   image     Task 4: build the container image, scan it (Trivy), push to GHCR
-# Later tasks add: signing, DAST.
+#   sign      Task 5: sign the image by digest and verify it (Cosign)
+# Later tasks add: DAST.
 #
 # Rules (team handover):
 #   - Observe first, then block: every check runs in report mode for now.
@@ -36,6 +37,7 @@ env:
   SYFT_IMAGE: anchore/syft:v1.55.0@sha256:4cc92b64ca74ffca4c94d4c8fcc01f217731375300be14d0b6eeb2e82eaa110a
   # Our own image in GitHub Container Registry (repository name is lowercase)
   APP_IMAGE: ghcr.io/${{ github.repository }}/juice-shop
+  COSIGN_VERSION: v3.1.4
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -329,3 +331,103 @@ jobs:
           name: image-scan-reports
           path: reports/
           retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Task 5: image signing and verification with Cosign
+  #
+  # Proves that the image we deploy is the one this pipeline built and that it
+  # was not modified afterwards. We sign the DIGEST (the content hash), never
+  # the tag, because a tag can be moved to another image.
+  #
+  # Keys: generated once with `cosign generate-key-pair`.
+  #   cosign.key + its password -> repository secrets COSIGN_PRIVATE_KEY and
+  #                                COSIGN_PASSWORD (never committed)
+  #   cosign.pub                -> committed at the repository root
+  # The private key is read from an environment variable (env://), so it is
+  # never written to the runner's disk.
+  # ---------------------------------------------------------------------------
+  sign:
+    name: sign (Cosign sign + verify)
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write # push the signature next to the image in GHCR
+    steps:
+      - name: Checkout (for cosign.pub)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Cosign (checksum verified)
+        run: |
+          base="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}"
+          curl -sSfL -o cosign-linux-amd64 "$base/cosign-linux-amd64"
+          curl -sSfL -o cosign_checksums.txt "$base/cosign_checksums.txt"
+          grep -E " cosign-linux-amd64$" cosign_checksums.txt | sha256sum --check
+          sudo install -m 0755 cosign-linux-amd64 /usr/local/bin/cosign
+          rm cosign-linux-amd64 cosign_checksums.txt
+          cosign version
+
+      - name: Check that the signing secrets exist
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          if [ -z "$COSIGN_PRIVATE_KEY" ] || [ -z "$COSIGN_PASSWORD" ]; then
+            echo "::error::Repository secrets COSIGN_PRIVATE_KEY and COSIGN_PASSWORD are not set"
+            exit 1
+          fi
+          test -f cosign.pub || { echo "::error::cosign.pub is missing from the repository"; exit 1; }
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Sign the image by digest
+        # Also records the signature in the public Sigstore transparency log (Rekor),
+        # so anyone can audit when this image was signed.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          echo "Signing $APP_IMAGE@$DIGEST"
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY "$APP_IMAGE@$DIGEST"
+
+      - name: Verify the signature (fails the build if it is missing or invalid)
+        env:
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          cosign verify --key cosign.pub "$APP_IMAGE@$DIGEST" | jq .
+          {
+            echo "### Image signed and verified"
+            echo "- Image: \`$APP_IMAGE@$DIGEST\`"
+            echo "- Verified with \`cosign.pub\` from the repository"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Negative test, an image we did not sign must be rejected
+        # The upstream Juice Shop image from Docker Hub was not signed with our key,
+        # so verification has to fail. If it passed, the check would be worthless.
+        # It must fail for the RIGHT reason ("no signatures found"), not because of a
+        # network error or a registry rate limit, otherwise the test proves nothing.
+        run: |
+          if out=$(cosign verify --key cosign.pub docker.io/bkimminich/juice-shop:latest 2>&1); then
+            echo "$out"
+            echo "::error::An image that we did not sign passed verification"
+            exit 1
+          fi
+          echo "$out"
+          if ! grep -q "no signatures found" <<< "$out"; then
+            echo "::error::Verification failed for an unexpected reason (see the output above)"
+            exit 1
+          fi
+          echo "As expected: the unsigned upstream image was rejected."
+          echo "- Unsigned upstream image \`bkimminich/juice-shop\`: rejected as expected" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
