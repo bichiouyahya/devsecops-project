@@ -1,4 +1,4 @@
-# Person A pipeline: code security (secrets, SAST; security tests added in Task 5)
+# Person A pipeline: code security (secrets, SAST, security unit tests)
 name: Code Security
 
 on:
@@ -132,3 +132,55 @@ jobs:
         uses: github/codeql-action/analyze@bd01fe9e80db3cb1eb1368bd8f61d3eb5f43d1f4 # v4.39.2
         with:
           category: codeql
+
+  security-tests:
+    name: Security unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install backend dependencies
+        # Juice Shop has no lockfile, so npm install (not npm ci).
+        # --ignore-scripts skips the postinstall that builds the Angular frontend:
+        # these API tests do not need the UI, and that build crashes npm on CI.
+        run: |
+          npm install --no-audit --no-fund --ignore-scripts
+          npm rebuild sqlite3
+
+      - name: Build server
+        run: npx tsc
+
+      - name: Create placeholder frontend files
+        # The server checks at startup that these files exist. API tests never load them.
+        run: |
+          d=frontend/dist/frontend
+          mkdir -p "$d"
+          for f in index.html styles.css main.js polyfills.js hacking-instructor-placeholder.js; do
+            echo "" > "$d/$f"
+          done
+
+      - name: Run security tests
+        # Observe mode: the tests prove the flaws exist, so they fail until the Task 7 fixes.
+        # Remove continue-on-error once they pass, then make this check required.
+        continue-on-error: true
+        run: |
+          node --import ./test/api/helpers/test-env.mjs --import tsx --test --test-force-exit \
+            --test-reporter=spec --test-reporter-destination=stdout \
+            --test-reporter=junit --test-reporter-destination=security-tests.xml \
+            test/security/security.test.ts
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: security-tests-report
+          path: security-tests.xml
