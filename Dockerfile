@@ -38,4 +38,7 @@ WORKDIR /juice-shop
 COPY --from=installer --chown=65532:0 /juice-shop .
 USER 65532
 EXPOSE 3000
+# Distroless has no shell or curl, so the health check uses the bundled Node.js binary
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD ["/nodejs/bin/node", "-e", "require('http').get('http://127.0.0.1:3000/rest/admin/application-version', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
 CMD ["/juice-shop/build/app.js"]
