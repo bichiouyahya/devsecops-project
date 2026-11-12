@@ -1,4 +1,5 @@
 # Person A pipeline: code security (secrets, SAST, security unit tests)
+# Every scan keeps a JSON report as an artifact (brief §6), next to SARIF for the Security tab.
 name: Code Security
 
 on:
@@ -33,8 +34,9 @@ jobs:
         run: |
           base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
           tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          curl -sSfL -o "$tarball" "$base/$tarball"
-          curl -sSfL -o checksums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          # HTTPS only, including after redirects, then checksum verified
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o "$tarball" "$base/$tarball"
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o checksums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
           sha256sum --check --ignore-missing checksums.txt
           tar -xzf "$tarball" gitleaks
           sudo mv gitleaks /usr/local/bin/
@@ -48,12 +50,22 @@ jobs:
             --report-format sarif --report-path gitleaks.sarif \
             --exit-code 1
 
+      - name: Write JSON report
+        # Same scan, same baseline, as JSON (Gitleaks writes one format per run).
+        if: always()
+        run: |
+          gitleaks git . --config .gitleaks.toml --redact \
+            --report-format json --report-path gitleaks.json \
+            --exit-code 0
+
       - name: Upload report as artifact
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gitleaks-report
-          path: gitleaks.sarif
+          path: |
+            gitleaks.sarif
+            gitleaks.json
 
       - name: Upload to GitHub Security tab
         if: always()
@@ -88,6 +100,7 @@ jobs:
             --config p/owasp-top-ten \
             --metrics off \
             --sarif --output semgrep.sarif \
+            --json-output semgrep.json \
             --text-output semgrep.txt
 
       - name: Show summary
@@ -101,6 +114,7 @@ jobs:
           name: semgrep-report
           path: |
             semgrep.sarif
+            semgrep.json
             semgrep.txt
 
       - name: Upload to GitHub Security tab
@@ -200,6 +214,7 @@ jobs:
           node --import ./test/api/helpers/test-env.mjs --import tsx --test --test-force-exit \
             --test-reporter=spec --test-reporter-destination=stdout \
             --test-reporter=junit --test-reporter-destination=security-tests.xml \
+            --test-reporter=./test/security/json-reporter.mjs --test-reporter-destination=security-tests.json \
             test/security/security.test.ts
 
       - name: Upload test report
@@ -207,7 +222,9 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-tests-report
-          path: security-tests.xml
+          path: |
+            security-tests.xml
+            security-tests.json
 
   # ---------------------------------------------------------------------------
   # Notification (brief §6): email the team when any job of this run fails.
