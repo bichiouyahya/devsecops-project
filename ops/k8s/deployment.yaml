@@ -62,9 +62,11 @@ spec:
             requests:
               cpu: 100m
               memory: 128Mi
+              ephemeral-storage: 64Mi
             limits:
               cpu: 500m
               memory: 256Mi
+              ephemeral-storage: 128Mi
           volumeMounts:
             - { name: data, mountPath: /seed/data }
             - { name: i18n, mountPath: /seed/i18n }
@@ -84,13 +86,18 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+          # Ephemeral storage also caps the emptyDir volumes above (about 42 MB of
+          # seeded files plus the SQLite journal and logs): a runaway write cannot
+          # fill the node's disk.
           resources:
             requests:
               cpu: 250m
               memory: 384Mi
+              ephemeral-storage: 256Mi
             limits:
               cpu: "1"
               memory: 1Gi
+              ephemeral-storage: 512Mi
           startupProbe:
             httpGet:
               path: /rest/admin/application-version
