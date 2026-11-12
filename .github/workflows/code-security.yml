@@ -207,9 +207,9 @@ jobs:
           done
 
       - name: Run security tests
-        # Observe mode: the tests prove the flaws exist, so they fail until the Task 7 fixes.
-        # Remove continue-on-error once they pass, then make this check required.
-        continue-on-error: true
+        # Blocking mode: fixed flaws are regression tests and must pass.
+        # Known unfixed flaws are marked "todo" in the test file: they run and are
+        # reported (spec, JUnit, JSON), but do not fail the job.
         run: |
           node --import ./test/api/helpers/test-env.mjs --import tsx --test --test-force-exit \
             --test-reporter=spec --test-reporter-destination=stdout \
