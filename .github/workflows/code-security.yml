@@ -133,6 +133,30 @@ jobs:
         with:
           category: codeql
 
+  sast-sonarqube:
+    name: SAST (SonarQube Cloud)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # SonarQube needs the history to tell new code from old code
+          persist-credentials: false
+
+      - name: SonarQube Cloud scan
+        # Settings (organization, project key, exclusions) are in sonar-project.properties.
+        # Quality gate "Sonar way" on new code. On pull requests the job waits for the
+        # gate result and fails if the gate fails, so this check can be required on main.
+        uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304 # v8.4.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >-
+            ${{ github.event_name == 'pull_request' && '-Dsonar.qualitygate.wait=true -Dsonar.qualitygate.timeout=600' || '' }}
+
   security-tests:
     name: Security unit tests
     runs-on: ubuntu-latest
