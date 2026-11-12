@@ -8,9 +8,20 @@
 #   sign      Task 5: sign the image by digest and verify it (Cosign)
 #   dast      Task 6: attack the running app with OWASP ZAP (baseline scan)
 #
+# Quality gates (policy and reasons: docs/quality-gates.md):
+#   - Every scan first writes its full report (Security tab + artifact), then a
+#     separate "gate" step decides whether the build fails. Steps marked
+#     "GATE (blocking)" fail the build; everything else is report only.
+#   - iac_scan  blocks on Hadolint warning/error and on any Checkov failure in
+#               the Dockerfile we ship (upstream Terraform: report only)
+#   - sca/image block on CRITICAL vulnerabilities that have a fix, except the
+#               accepted ones in .trivyignore (reason + expiry date each)
+#   - sign      blocks on a missing or invalid signature
+#   - dast      blocks on ZAP alerts of risk Medium or higher, except the
+#               accepted ones in .zap/accepted-alerts.tsv
+#   Accepted findings follow docs/exemption-process.md.
+#
 # Rules (team handover):
-#   - Observe first, then block: every check runs in report mode for now.
-#     See the "GATE" comments for the switch that makes it fail the build.
 #   - Actions pinned by commit SHA, images pinned by digest, never by tag.
 #   - Least privilege: read only by default, each job asks for what it needs.
 
@@ -59,19 +70,21 @@ jobs:
           persist-credentials: false
 
       - name: Hadolint (Dockerfile best practices)
-        # GATE: remove --no-fail and add --failure-threshold error to block the build.
+        # GATE (blocking): fails on any warning or error. Info notes (for example
+        # DL3059 "consecutive RUN") are style advice and do not block.
         run: |
           mkdir -p reports
-          # Readable output in the job log
-          docker run --rm -v "$PWD:/src" -w /src "$HADOLINT_IMAGE" \
-            /bin/hadolint --no-fail Dockerfile infrastructure/Dockerfile
-          # SARIF for the Security tab
+          # SARIF for the Security tab (all findings, never fails)
           docker run --rm -v "$PWD:/src" -w /src "$HADOLINT_IMAGE" \
             /bin/hadolint --no-fail -f sarif Dockerfile infrastructure/Dockerfile \
             > reports/hadolint.sarif
+          # Readable output in the job log + gate
+          docker run --rm -v "$PWD:/src" -w /src "$HADOLINT_IMAGE" \
+            /bin/hadolint --failure-threshold warning Dockerfile infrastructure/Dockerfile
 
       - name: Checkov (Dockerfile, Terraform, secrets)
-        # GATE: remove --soft-fail (or use --soft-fail-on LOW,MEDIUM) to block the build.
+        # Report only (--soft-fail): the upstream Terraform and infrastructure/Dockerfile
+        # describe an AWS setup we do not deploy. The gate is the next step.
         # Writes reports/results_cli.txt and reports/results_sarif.sarif
         run: |
           docker run --rm -v "$PWD:/src" -w /src "$CHECKOV_IMAGE" \
@@ -79,6 +92,12 @@ jobs:
             -o cli -o sarif --output-file-path reports \
             --soft-fail --quiet --compact
           cat reports/results_cli.txt
+
+      - name: Checkov gate (the Dockerfile we ship)
+        # GATE (blocking): any failed Checkov check on ./Dockerfile fails the build.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$CHECKOV_IMAGE" \
+            -f Dockerfile --framework dockerfile --quiet --compact
 
       - name: Upload Hadolint results to GitHub Security tab
         if: always()
@@ -140,8 +159,8 @@ jobs:
             --ignore-scripts --no-audit --no-fund --legacy-peer-deps
 
       - name: Trivy filesystem scan (HIGH, CRITICAL)
-        # GATE: change --exit-code 0 to --exit-code 1 (and --severity CRITICAL)
-        # in the table step to fail the build on critical vulnerabilities.
+        # Report only. --ignorefile /dev/null: the reports show EVERY finding,
+        # including the accepted ones; only the gate step applies .trivyignore.
         run: |
           mkdir -p reports "$RUNNER_TEMP/trivy-cache"
           # Shared cache: the vulnerability database is downloaded only once
@@ -151,16 +170,16 @@ jobs:
               "$TRIVY_IMAGE" "$@"
           }
           # Readable table in the job log
-          trivy fs --scanners vuln --severity HIGH,CRITICAL \
+          trivy fs --scanners vuln --severity HIGH,CRITICAL --ignorefile /dev/null \
             --format table --exit-code 0 .
           # SARIF for the Security tab, JSON (all severities) for the comparison table
-          trivy fs --scanners vuln --severity HIGH,CRITICAL --skip-db-update \
-            --format sarif --output reports/trivy-fs.sarif .
-          trivy fs --scanners vuln --skip-db-update \
+          trivy fs --scanners vuln --severity HIGH,CRITICAL --ignorefile /dev/null \
+            --skip-db-update --format sarif --output reports/trivy-fs.sarif .
+          trivy fs --scanners vuln --ignorefile /dev/null --skip-db-update \
             --format json --output reports/trivy-fs.json .
 
       - name: npm audit (second opinion, for the tool comparison)
-        # GATE: remove "|| true" to fail the build at --audit-level=high.
+        # Report only: Trivy is the gate (docs/sca/tool-comparison.md explains why).
         run: |
           echo "### Backend (production dependencies)"
           npm audit --omit=dev --audit-level=high || true
@@ -169,6 +188,17 @@ jobs:
           cd frontend
           npm audit --audit-level=high || true
           npm audit --json > ../reports/npm-audit-frontend.json || true
+
+      - name: Trivy gate (CRITICAL with a fix available)
+        # GATE (blocking): fails on any CRITICAL vulnerability that has a fixed
+        # version, except the accepted ones in .trivyignore. Unfixable CRITICALs
+        # are reported above but do not block: nobody could act on them.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" fs --scanners vuln --skip-db-update \
+            --severity CRITICAL --ignore-unfixed --ignorefile .trivyignore \
+            --exit-code 1 --format table .
 
       - name: Upload Trivy results to GitHub Security tab
         if: always()
@@ -278,8 +308,7 @@ jobs:
       - name: Trivy image scan (HIGH, CRITICAL)
         # The image is exported to a tar file and scanned offline, so Trivy
         # never gets access to the Docker socket (that would be root on the runner).
-        # GATE: change --exit-code 0 to --exit-code 1 in the table step
-        # (with --severity CRITICAL --ignore-unfixed) to stop before the push.
+        # Report only (all findings); the gate is the next step.
         run: |
           mkdir -p reports "$RUNNER_TEMP/trivy-cache"
           docker save "$APP_IMAGE:$GITHUB_SHA" -o "$RUNNER_TEMP/image.tar"
@@ -290,13 +319,26 @@ jobs:
               "$TRIVY_IMAGE" "$@"
           }
           # Readable table in the job log
-          trivy image --input /scan/image.tar --scanners vuln \
+          trivy image --input /scan/image.tar --scanners vuln --ignorefile /dev/null \
             --severity HIGH,CRITICAL --format table --exit-code 0
           # SARIF for the Security tab, JSON (all severities) for the report
-          trivy image --input /scan/image.tar --scanners vuln --skip-db-update \
-            --severity HIGH,CRITICAL --format sarif --output reports/trivy-image.sarif
-          trivy image --input /scan/image.tar --scanners vuln --skip-db-update \
-            --format json --output reports/trivy-image.json
+          trivy image --input /scan/image.tar --scanners vuln --ignorefile /dev/null \
+            --skip-db-update --severity HIGH,CRITICAL \
+            --format sarif --output reports/trivy-image.sarif
+          trivy image --input /scan/image.tar --scanners vuln --ignorefile /dev/null \
+            --skip-db-update --format json --output reports/trivy-image.json
+
+      - name: Trivy image gate (CRITICAL with a fix, BEFORE the push)
+        # GATE (blocking): same rule as the sca job, on what is actually shipped.
+        # It runs before the push, so a failing image never reaches the registry
+        # (and is therefore never signed, deployed or scanned by ZAP).
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            -v "$RUNNER_TEMP:/scan:ro" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" image --input /scan/image.tar --scanners vuln --skip-db-update \
+            --severity CRITICAL --ignore-unfixed --ignorefile .trivyignore \
+            --exit-code 1 --format table
           rm -f "$RUNNER_TEMP/image.tar"
 
       - name: Push image to GHCR
@@ -453,6 +495,11 @@ jobs:
       contents: read
       packages: read # pull our image from GHCR
     steps:
+      - name: Checkout (for .zap/accepted-alerts.tsv)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Pull the signed image from GHCR
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -480,8 +527,8 @@ jobs:
           exit 1
 
       - name: ZAP baseline scan
-        # Exit codes: 0 = no alerts, 1 = FAIL alerts, 2 = WARN alerts only, 3 = error.
-        # GATE: after tuning the rules, fail the build on exit code 1 (FAIL alerts).
+        # Report only: -I keeps ZAP from failing on warnings; the gate is the next step.
+        # Exit code 3 means ZAP itself failed, which always fails the job.
         run: |
           mkdir -p zap && chmod 777 zap # the ZAP container runs as user "zap"
           set +e
@@ -499,6 +546,31 @@ jobs:
             echo "### ZAP baseline scan (exit code $code)"
             cat zap/zap-report.md
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: ZAP gate (new alerts of risk Medium or higher)
+        # GATE (blocking): any Medium/High alert whose plugin ID is not accepted in
+        # .zap/accepted-alerts.tsv (or whose acceptance has expired) fails the build.
+        run: |
+          report=zap/zap-report.json
+          accepted_file=.zap/accepted-alerts.tsv
+          today=$(date -u +%F)
+          # Plugin IDs whose acceptance has not expired
+          accepted=$(tr -d '\r' < "$accepted_file" | grep -vE '^[[:space:]]*(#|$)' \
+            | awk -F'\t' -v today="$today" '$3 >= today { print $1 }')
+          echo "Accepted (not expired): ${accepted:-none}"
+          blocking=$(jq -r --arg acc "$accepted" '
+            ($acc | split("\n")) as $ok
+            | [.site[].alerts[]
+               | select((.riskcode | tonumber) >= 2)
+               | select(.pluginid as $p | ($ok | index($p)) | not)
+               | "\(.pluginid)  \(.riskdesc)  \(.name)"]
+            | unique | .[]' "$report")
+          if [ -n "$blocking" ]; then
+            echo "::error::New ZAP alerts of risk Medium or higher:"
+            echo "$blocking"
+            exit 1
+          fi
+          echo "No new Medium or higher ZAP alert."
 
       - name: Stop Juice Shop
         if: always()

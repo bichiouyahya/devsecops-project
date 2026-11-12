@@ -1,0 +1,11 @@
+# Accepted ZAP alerts (DAST baseline), Person B quality gate.
+#
+# The dast job fails on any alert of risk Medium or higher (riskcode >= 2)
+# that is NOT listed here. Low and Informational alerts never block.
+# Every entry is a reviewed decision: reason, approving pull request, and an
+# expiry date (YYYY-MM-DD); after that date the alert blocks again until the
+# decision is reviewed. Process: docs/exemption-process.md.
+#
+# Columns (tab-separated): pluginid, alert name, expires, reason
+10038	Content Security Policy (CSP) Header Not Set	2027-01-31	Juice Shop serves inline scripts and relies on reflected XSS for its challenges; a strict CSP needs frontend changes out of scope. Fix candidate (docs/dast/README.md). Approved in the quality gates PR.
+10098	Cross-Domain Misconfiguration	2027-01-31	server.ts calls cors() with no options (Access-Control-Allow-Origin: *), needed by the Juice Shop challenges and tooling. Local demo only, never public. Approved in the quality gates PR.
