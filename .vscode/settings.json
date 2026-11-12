@@ -1,0 +1,9 @@
+{
+  "semgrep.scan.configuration": [
+    "p/javascript",
+    "p/typescript",
+    "p/nodejsscan",
+    "p/owasp-top-ten"
+  ],
+  "semgrep.scan.onlyGitDirty": false
+}
