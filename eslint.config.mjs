@@ -6,6 +6,7 @@
 // @ts-check
 import neostandard from 'neostandard'
 import globals from 'globals'
+import pluginSecurity from 'eslint-plugin-security'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -24,6 +25,8 @@ export default [
     ]
   },
   ...neostandard({ ts: true }),
+  // Security rules (DevSecOps, shift-left): flag risky patterns while coding. All rules are warnings.
+  pluginSecurity.configs.recommended,
   {
     languageOptions: {
       globals: {
