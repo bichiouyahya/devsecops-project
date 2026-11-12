@@ -583,3 +583,84 @@ jobs:
           name: zap-reports
           path: zap/
           retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Notification (brief §6): email the team when any job of this run fails.
+  # Sent with curl over SMTP with STARTTLS required: no third-party action, and
+  # the password never travels in clear text. The job has no GitHub token at
+  # all (permissions: {}). Secrets: SMTP_USERNAME, SMTP_PASSWORD (an app
+  # password, not the account password), NOTIFY_EMAIL_TO (comma-separated);
+  # the addresses are secrets so they stay out of this public repo and its logs.
+  # ---------------------------------------------------------------------------
+  notify:
+    name: Notify on failure (email)
+    needs: [iac_scan, sca, sbom, image, sign, dast]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Send failure email
+        env:
+          SMTP_SERVER: smtp.gmail.com:587
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+          NEEDS: ${{ toJSON(needs) }}
+          WORKFLOW: ${{ github.workflow }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.head_ref || github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$SMTP_USERNAME" ] || [ -z "$SMTP_PASSWORD" ] || [ -z "$NOTIFY_EMAIL_TO" ]; then
+            echo "::warning::Email secrets are not set: no notification sent"
+            exit 0
+          fi
+          # Jobs of this run that failed (from the needs context)
+          failed=$(jq -r 'to_entries[] | select(.value.result == "failure") | "  - " + .key' <<< "$NEEDS")
+          # Single-line values only, so nothing can be injected into the mail headers
+          ref=$(printf '%s' "$REF_NAME" | tr -d '\r\n')
+          title=$(printf '%s' "$PR_TITLE" | tr -d '\r\n')
+          {
+            echo "From: DevSecOps pipeline <$SMTP_USERNAME>"
+            echo "To: $NOTIFY_EMAIL_TO"
+            echo "Subject: [FAILED] $WORKFLOW on $ref"
+            echo "Date: $(date -R)"
+            echo "MIME-Version: 1.0"
+            echo "Content-Type: text/plain; charset=UTF-8"
+            echo
+            echo "The \"$WORKFLOW\" pipeline failed."
+            echo
+            echo "Repository: $REPOSITORY"
+            echo "Branch:     $ref"
+            [ -n "$title" ] && echo "Pull request: $title"
+            echo "Event:      $EVENT, by $ACTOR"
+            echo "Commit:     $SHA"
+            echo
+            echo "Failed job(s):"
+            echo "$failed"
+            echo
+            echo "Logs and reports: $RUN_URL"
+          } > mail.txt
+          # One --mail-rcpt per address in NOTIFY_EMAIL_TO (comma-separated)
+          rcpt=()
+          count=0
+          IFS=',' read -ra addrs <<< "$NOTIFY_EMAIL_TO"
+          for a in "${addrs[@]}"; do
+            a=$(printf '%s' "$a" | tr -d '[:space:]')
+            if [ -n "$a" ]; then
+              rcpt+=(--mail-rcpt "$a")
+              count=$((count + 1))
+            fi
+          done
+          # SMTP with STARTTLS required: the password is never sent in clear text
+          curl --silent --show-error --ssl-reqd \
+            --url "smtp://$SMTP_SERVER" \
+            --user "$SMTP_USERNAME:$SMTP_PASSWORD" \
+            --mail-from "$SMTP_USERNAME" "${rcpt[@]}" \
+            --upload-file mail.txt
+          echo "Failure email sent to $count recipient(s)."
