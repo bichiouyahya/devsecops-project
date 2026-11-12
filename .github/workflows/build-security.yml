@@ -4,11 +4,28 @@
 #   iac_scan  Task 1: Dockerfile and IaC scanning (Hadolint, Checkov)
 #   sca       Task 2: vulnerable dependencies (Trivy, npm audit)
 #   sbom      Task 3: software bill of materials (Syft, CycloneDX)
-# Later tasks add: image build + scan, signing, DAST.
+#   image     Task 4: build the container image, scan it (Trivy), push to GHCR
+#   sign      Task 5: sign the image by digest and verify it (Cosign)
+#   deploy_staging  Task 6 + Ops: verify the signature (deploy gate), deploy the
+#             image by digest to an ephemeral Kubernetes staging cluster (kind)
+#             inside the runner, then attack it with OWASP ZAP (baseline scan)
+#
+# Quality gates (policy and reasons: docs/quality-gates.md):
+#   - Every scan first writes its full report (Security tab + artifact), then a
+#     separate "gate" step decides whether the build fails. Steps marked
+#     "GATE (blocking)" fail the build; everything else is report only.
+#   - iac_scan  blocks on Hadolint warning/error and on any Checkov failure in
+#               the Dockerfile we ship (upstream Terraform: report only)
+#   - sca/image block on CRITICAL vulnerabilities that have a fix, except the
+#               accepted ones in .trivyignore (reason + expiry date each)
+#   - sign      blocks on a missing or invalid signature
+#   - deploy_staging  refuses to deploy an image without a valid signature, and
+#               blocks on ZAP alerts of risk Medium or higher, except the
+#               accepted ones in .zap/accepted-alerts.tsv
+#   - iac_scan  also blocks on any Checkov failure in ops/k8s/ (we deploy it)
+#   Accepted findings follow docs/exemption-process.md.
 #
 # Rules (team handover):
-#   - Observe first, then block: every check runs in report mode for now.
-#     See the "GATE" comments for the switch that makes it fail the build.
 #   - Actions pinned by commit SHA, images pinned by digest, never by tag.
 #   - Least privilege: read only by default, each job asks for what it needs.
 
@@ -33,11 +50,16 @@ env:
   CHECKOV_IMAGE: bridgecrew/checkov:3.3.29@sha256:3cc125b5337717b7303dbddd4e79374c120687b5ff6a24f9abdad56b562469f3
   TRIVY_IMAGE: aquasec/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222
   SYFT_IMAGE: anchore/syft:v1.55.0@sha256:4cc92b64ca74ffca4c94d4c8fcc01f217731375300be14d0b6eeb2e82eaa110a
+  # Our own image in GitHub Container Registry (repository name is lowercase)
+  APP_IMAGE: ghcr.io/${{ github.repository }}/juice-shop
+  COSIGN_VERSION: v3.1.4
+  ZAP_IMAGE: ghcr.io/zaproxy/zaproxy:2.17.0@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
 
 jobs:
   # ---------------------------------------------------------------------------
   # Task 1: Dockerfile linting (Hadolint) + IaC scanning (Checkov)
-  # Scans: Dockerfile, infrastructure/Dockerfile, terraform/, infrastructure/terraform/
+  # Scans: Dockerfile, infrastructure/Dockerfile, terraform/, infrastructure/terraform/,
+  #        and our Kubernetes manifests in ops/k8s/
   # ---------------------------------------------------------------------------
   iac_scan:
     name: iac_scan (Hadolint + Checkov)
@@ -53,26 +75,40 @@ jobs:
           persist-credentials: false
 
       - name: Hadolint (Dockerfile best practices)
-        # GATE: remove --no-fail and add --failure-threshold error to block the build.
+        # GATE (blocking): fails on any warning or error. Info notes (for example
+        # DL3059 "consecutive RUN") are style advice and do not block.
         run: |
           mkdir -p reports
-          # Readable output in the job log
-          docker run --rm -v "$PWD:/src" -w /src "$HADOLINT_IMAGE" \
-            /bin/hadolint --no-fail Dockerfile infrastructure/Dockerfile
-          # SARIF for the Security tab
+          # SARIF for the Security tab (all findings, never fails)
           docker run --rm -v "$PWD:/src" -w /src "$HADOLINT_IMAGE" \
             /bin/hadolint --no-fail -f sarif Dockerfile infrastructure/Dockerfile \
             > reports/hadolint.sarif
+          # Readable output in the job log + gate
+          docker run --rm -v "$PWD:/src" -w /src "$HADOLINT_IMAGE" \
+            /bin/hadolint --failure-threshold warning Dockerfile infrastructure/Dockerfile
 
-      - name: Checkov (Dockerfile, Terraform, secrets)
-        # GATE: remove --soft-fail (or use --soft-fail-on LOW,MEDIUM) to block the build.
+      - name: Checkov (Dockerfile, Terraform, Kubernetes, secrets)
+        # Report only (--soft-fail): the upstream Terraform and infrastructure/Dockerfile
+        # describe an AWS setup we do not deploy. The gates are the next steps.
         # Writes reports/results_cli.txt and reports/results_sarif.sarif
         run: |
           docker run --rm -v "$PWD:/src" -w /src "$CHECKOV_IMAGE" \
-            -d . --framework dockerfile,secrets,terraform \
+            -d . --framework dockerfile,kubernetes,secrets,terraform \
             -o cli -o sarif --output-file-path reports \
             --soft-fail --quiet --compact
           cat reports/results_cli.txt
+
+      - name: Checkov gate (the Dockerfile we ship)
+        # GATE (blocking): any failed Checkov check on ./Dockerfile fails the build.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$CHECKOV_IMAGE" \
+            -f Dockerfile --framework dockerfile --quiet --compact
+
+      - name: Checkov gate (the Kubernetes manifests we deploy)
+        # GATE (blocking): any failed Checkov check on ops/k8s/ fails the build.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$CHECKOV_IMAGE" \
+            -d ops/k8s --framework kubernetes --quiet --compact
 
       - name: Upload Hadolint results to GitHub Security tab
         if: always()
@@ -134,8 +170,8 @@ jobs:
             --ignore-scripts --no-audit --no-fund --legacy-peer-deps
 
       - name: Trivy filesystem scan (HIGH, CRITICAL)
-        # GATE: change --exit-code 0 to --exit-code 1 (and --severity CRITICAL)
-        # in the table step to fail the build on critical vulnerabilities.
+        # Report only. --ignorefile /dev/null: the reports show EVERY finding,
+        # including the accepted ones; only the gate step applies .trivyignore.
         run: |
           mkdir -p reports "$RUNNER_TEMP/trivy-cache"
           # Shared cache: the vulnerability database is downloaded only once
@@ -145,16 +181,16 @@ jobs:
               "$TRIVY_IMAGE" "$@"
           }
           # Readable table in the job log
-          trivy fs --scanners vuln --severity HIGH,CRITICAL \
+          trivy fs --scanners vuln --severity HIGH,CRITICAL --ignorefile /dev/null \
             --format table --exit-code 0 .
           # SARIF for the Security tab, JSON (all severities) for the comparison table
-          trivy fs --scanners vuln --severity HIGH,CRITICAL --skip-db-update \
-            --format sarif --output reports/trivy-fs.sarif .
-          trivy fs --scanners vuln --skip-db-update \
+          trivy fs --scanners vuln --severity HIGH,CRITICAL --ignorefile /dev/null \
+            --skip-db-update --format sarif --output reports/trivy-fs.sarif .
+          trivy fs --scanners vuln --ignorefile /dev/null --skip-db-update \
             --format json --output reports/trivy-fs.json .
 
       - name: npm audit (second opinion, for the tool comparison)
-        # GATE: remove "|| true" to fail the build at --audit-level=high.
+        # Report only: Trivy is the gate (docs/sca/tool-comparison.md explains why).
         run: |
           echo "### Backend (production dependencies)"
           npm audit --omit=dev --audit-level=high || true
@@ -163,6 +199,17 @@ jobs:
           cd frontend
           npm audit --audit-level=high || true
           npm audit --json > ../reports/npm-audit-frontend.json || true
+
+      - name: Trivy gate (CRITICAL with a fix available)
+        # GATE (blocking): fails on any CRITICAL vulnerability that has a fixed
+        # version, except the accepted ones in .trivyignore. Unfixable CRITICALs
+        # are reported above but do not block: nobody could act on them.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" fs --scanners vuln --skip-db-update \
+            --severity CRITICAL --ignore-unfixed --ignorefile .trivyignore \
+            --exit-code 1 --format table .
 
       - name: Upload Trivy results to GitHub Security tab
         if: always()
@@ -235,3 +282,492 @@ jobs:
           name: sbom
           path: sbom.cdx.json
           retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Task 4: container build, image scan, push to GitHub Container Registry
+  #
+  # The image adds OS packages and layers that the source scan cannot see.
+  # Order: build -> scan -> push, so that once the gate is on, a vulnerable
+  # image never reaches the registry. Tagged with the commit SHA (traceable,
+  # never overwritten); the digest is exported for signing (Task 5).
+  # ---------------------------------------------------------------------------
+  image:
+    name: image (build, Trivy scan, push to GHCR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io with the job's own short-lived token
+      security-events: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build image (tagged with the commit SHA)
+        # Full Juice Shop build (backend + Angular frontend): about 10 minutes.
+        run: |
+          docker build \
+            --build-arg VCS_REF="$GITHUB_SHA" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "$APP_IMAGE:$GITHUB_SHA" .
+          docker image ls "$APP_IMAGE"
+
+      - name: Trivy image scan (HIGH, CRITICAL)
+        # The image is exported to a tar file and scanned offline, so Trivy
+        # never gets access to the Docker socket (that would be root on the runner).
+        # Report only (all findings); the gate is the next step.
+        run: |
+          mkdir -p reports "$RUNNER_TEMP/trivy-cache"
+          docker save "$APP_IMAGE:$GITHUB_SHA" -o "$RUNNER_TEMP/image.tar"
+          trivy() {
+            docker run --rm -v "$PWD:/src" -w /src \
+              -v "$RUNNER_TEMP:/scan:ro" \
+              -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+              "$TRIVY_IMAGE" "$@"
+          }
+          # Readable table in the job log
+          trivy image --input /scan/image.tar --scanners vuln --ignorefile /dev/null \
+            --severity HIGH,CRITICAL --format table --exit-code 0
+          # SARIF for the Security tab, JSON (all severities) for the report
+          trivy image --input /scan/image.tar --scanners vuln --ignorefile /dev/null \
+            --skip-db-update --severity HIGH,CRITICAL \
+            --format sarif --output reports/trivy-image.sarif
+          trivy image --input /scan/image.tar --scanners vuln --ignorefile /dev/null \
+            --skip-db-update --format json --output reports/trivy-image.json
+
+      - name: Trivy image gate (CRITICAL with a fix, BEFORE the push)
+        # GATE (blocking): same rule as the sca job, on what is actually shipped.
+        # It runs before the push, so a failing image never reaches the registry
+        # (and is therefore never signed, deployed or scanned by ZAP).
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            -v "$RUNNER_TEMP:/scan:ro" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" image --input /scan/image.tar --scanners vuln --skip-db-update \
+            --severity CRITICAL --ignore-unfixed --ignorefile .trivyignore \
+            --exit-code 1 --format table
+          rm -f "$RUNNER_TEMP/image.tar"
+
+      - name: Push image to GHCR
+        id: push
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          docker push "$APP_IMAGE:$GITHUB_SHA"
+          # The digest identifies the exact image content; Task 5 signs this, not the tag
+          ref=$(docker inspect --format='{{index .RepoDigests 0}}' "$APP_IMAGE:$GITHUB_SHA")
+          digest="${ref#*@}"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Image pushed"
+            echo "- Tag: \`$APP_IMAGE:$GITHUB_SHA\`"
+            echo "- Digest: \`$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          docker logout ghcr.io
+
+      - name: Upload Trivy results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          sarif_file: reports/trivy-image.sarif
+          category: trivy-image
+
+      - name: Keep the image scan reports as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-scan-reports
+          path: reports/
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Task 5: image signing and verification with Cosign
+  #
+  # Proves that the image we deploy is the one this pipeline built and that it
+  # was not modified afterwards. We sign the DIGEST (the content hash), never
+  # the tag, because a tag can be moved to another image.
+  #
+  # Keys: generated once with `cosign generate-key-pair`.
+  #   cosign.key + its password -> repository secrets COSIGN_PRIVATE_KEY and
+  #                                COSIGN_PASSWORD (never committed)
+  #   cosign.pub                -> committed at the repository root
+  # The private key is read from an environment variable (env://), so it is
+  # never written to the runner's disk.
+  # ---------------------------------------------------------------------------
+  sign:
+    name: sign (Cosign sign + verify)
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write # push the signature next to the image in GHCR
+    steps:
+      - name: Checkout (for cosign.pub)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Cosign (checksum verified)
+        run: |
+          base="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}"
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o cosign-linux-amd64 "$base/cosign-linux-amd64"
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o cosign_checksums.txt "$base/cosign_checksums.txt"
+          grep -E " cosign-linux-amd64$" cosign_checksums.txt | sha256sum --check
+          sudo install -m 0755 cosign-linux-amd64 /usr/local/bin/cosign
+          rm cosign-linux-amd64 cosign_checksums.txt
+          cosign version
+
+      - name: Check that the signing secrets exist
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          if [ -z "$COSIGN_PRIVATE_KEY" ] || [ -z "$COSIGN_PASSWORD" ]; then
+            echo "::error::Repository secrets COSIGN_PRIVATE_KEY and COSIGN_PASSWORD are not set"
+            exit 1
+          fi
+          test -f cosign.pub || { echo "::error::cosign.pub is missing from the repository"; exit 1; }
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Sign the image by digest
+        # Also records the signature in the public Sigstore transparency log (Rekor),
+        # so anyone can audit when this image was signed.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          echo "Signing $APP_IMAGE@$DIGEST"
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY "$APP_IMAGE@$DIGEST"
+
+      - name: Verify the signature (fails the build if it is missing or invalid)
+        env:
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          cosign verify --key cosign.pub "$APP_IMAGE@$DIGEST" | jq .
+          {
+            echo "### Image signed and verified"
+            echo "- Image: \`$APP_IMAGE@$DIGEST\`"
+            echo "- Verified with \`cosign.pub\` from the repository"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Negative test, an image we did not sign must be rejected
+        # The upstream Juice Shop image from Docker Hub was not signed with our key,
+        # so verification has to fail. If it passed, the check would be worthless.
+        # It must fail for the RIGHT reason ("no signatures found"), not because of a
+        # network error or a registry rate limit, otherwise the test proves nothing.
+        run: |
+          if out=$(cosign verify --key cosign.pub docker.io/bkimminich/juice-shop:latest 2>&1); then
+            echo "$out"
+            echo "::error::An image that we did not sign passed verification"
+            exit 1
+          fi
+          echo "$out"
+          if ! grep -q "no signatures found" <<< "$out"; then
+            echo "::error::Verification failed for an unexpected reason (see the output above)"
+            exit 1
+          fi
+          echo "As expected: the unsigned upstream image was rejected."
+          echo "- Unsigned upstream image \`bkimminich/juice-shop\`: rejected as expected" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
+
+  # ---------------------------------------------------------------------------
+  # Task 6 + Ops: staging deployment with a deploy-time signature gate, then DAST
+  #
+  # An ephemeral Kubernetes cluster (kind) is created INSIDE the GitHub-hosted
+  # runner and deleted at the end of the job: nothing is ever public, nothing
+  # runs on our PCs, and no self-hosted runner is needed (this repo is public).
+  #
+  # 1. Deploy gate: `cosign verify` of the image digest BEFORE any kubectl apply.
+  #    No valid signature = nothing is deployed.
+  # 2. Negative test: the same gate must refuse the unsigned upstream image.
+  # 3. Deploy the hardened manifests of ops/k8s/ with the verified DIGEST
+  #    (never a tag), wait for the rollout.
+  # 4. DAST: OWASP ZAP baseline (passive) against the deployed Service through
+  #    kubectl port-forward on the runner's 127.0.0.1.
+  # Tool versions: kind, its node image and kubectl pinned below, binaries
+  # checked against the SHA-256 recorded here before they run.
+  # ---------------------------------------------------------------------------
+  deploy_staging:
+    name: deploy_staging (verify signature, deploy to kind, ZAP)
+    needs: [image, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    env:
+      KIND_VERSION: v0.33.0
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+      KIND_NODE_IMAGE: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+      KUBECTL_VERSION: v1.37.2
+      KUBECTL_SHA256: c04487523e7aa7d1493f7808174c899db93d7a9cf57531420cd76b9bd415f8f4
+      CLUSTER: staging
+      NAMESPACE: juice-shop-staging
+      DIGEST: ${{ needs.image.outputs.digest }}
+    steps:
+      - name: Checkout (manifests, cosign.pub, ZAP accepted alerts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Cosign, kind and kubectl (checksums verified)
+        run: |
+          base="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}"
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o cosign-linux-amd64 "$base/cosign-linux-amd64"
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o cosign_checksums.txt "$base/cosign_checksums.txt"
+          grep -E " cosign-linux-amd64$" cosign_checksums.txt | sha256sum --check
+          sudo install -m 0755 cosign-linux-amd64 /usr/local/bin/cosign
+
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  kind" | sha256sum --check
+          sudo install -m 0755 kind /usr/local/bin/kind
+
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  kubectl" | sha256sum --check
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+
+          rm -f cosign-linux-amd64 cosign_checksums.txt kind kubectl
+          cosign version | grep GitVersion; kind version; kubectl version --client
+
+      - name: Deploy gate, verify the signature before deploying
+        # GATE (blocking): no valid signature from cosign.pub = the job stops here
+        # and nothing is deployed.
+        run: |
+          cosign verify --key cosign.pub "$APP_IMAGE@$DIGEST" | jq .
+          {
+            echo "### Deploy gate: signature verified"
+            echo "- Image: \`$APP_IMAGE@$DIGEST\`"
+            echo "- Key: \`cosign.pub\` from the repository"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Negative test, the deploy gate refuses an unsigned image
+        # The unsigned upstream image must be refused for the RIGHT reason
+        # ("no signatures found"), otherwise the gate proves nothing.
+        run: |
+          if out=$(cosign verify --key cosign.pub docker.io/bkimminich/juice-shop:latest 2>&1); then
+            echo "$out"
+            echo "::error::The deploy gate accepted an image that we did not sign"
+            exit 1
+          fi
+          echo "$out"
+          if ! grep -q "no signatures found" <<< "$out"; then
+            echo "::error::Verification failed for an unexpected reason (see the output above)"
+            exit 1
+          fi
+          echo "As expected: the unsigned image was refused, it would never be deployed."
+          echo "- Unsigned image \`bkimminich/juice-shop\`: refused by the deploy gate" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create the staging cluster (kind, inside this runner only)
+        run: |
+          kind create cluster --name "$CLUSTER" --image "$KIND_NODE_IMAGE" --wait 120s
+          kubectl cluster-info
+          kubectl get nodes -o wide
+
+      - name: Deploy the verified image by digest
+        run: |
+          mkdir -p rendered
+          cp ops/k8s/*.yaml rendered/
+          # Replace the default digest with the one verified above (never a tag)
+          sed -E -i "s#ghcr\.io/[^@[:space:]]+/juice-shop@sha256:[0-9a-f]{64}#${APP_IMAGE}@${DIGEST}#g" rendered/deployment.yaml
+          n=$(grep -c "${APP_IMAGE}@${DIGEST}" rendered/deployment.yaml)
+          if [ "$n" -ne 2 ]; then
+            echo "::error::Expected the verified digest in 2 places (init container + app), found $n"
+            exit 1
+          fi
+          kubectl apply -f rendered/namespace.yaml
+          kubectl apply -f rendered/
+          kubectl -n "$NAMESPACE" rollout status deployment/juice-shop --timeout=300s
+          kubectl -n "$NAMESPACE" get pods,svc,networkpolicy -o wide
+          {
+            echo "### Staging deployment"
+            echo "- Cluster: ephemeral kind cluster \`$CLUSTER\` inside the runner"
+            echo "- Deployed: \`$APP_IMAGE@$DIGEST\` (signature verified above)"
+            echo "- Namespace \`$NAMESPACE\`: Pod Security \"restricted\", read-only root filesystem, non-root, no capabilities"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Expose staging on the runner's localhost for ZAP
+        run: |
+          nohup kubectl -n "$NAMESPACE" port-forward svc/juice-shop 3000:3000 \
+            --address 127.0.0.1 > port-forward.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:3000/rest/admin/application-version; then
+              echo "Staging answers on 127.0.0.1:3000 after $((i * 2)) seconds"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Staging is not reachable through port-forward"
+          cat port-forward.log
+          exit 1
+
+      - name: ZAP baseline scan
+        # Report only: -I keeps ZAP from failing on warnings; the gate is the next step.
+        # Exit code 3 means ZAP itself failed, which always fails the job.
+        run: |
+          mkdir -p zap && chmod 777 zap # the ZAP container runs as user "zap"
+          set +e
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk" "$ZAP_IMAGE" \
+            zap-baseline.py -t http://127.0.0.1:3000 \
+            -r zap-report.html -J zap-report.json -w zap-report.md -I
+          code=$?
+          set -e
+          echo "ZAP exit code: $code"
+          if [ "$code" -eq 3 ]; then
+            echo "::error::ZAP failed to run the scan"
+            exit 1
+          fi
+          {
+            echo "### ZAP baseline scan against staging (exit code $code)"
+            cat zap/zap-report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: ZAP gate (new alerts of risk Medium or higher)
+        # GATE (blocking): any Medium/High alert whose plugin ID is not accepted in
+        # .zap/accepted-alerts.tsv (or whose acceptance has expired) fails the build.
+        run: |
+          report=zap/zap-report.json
+          accepted_file=.zap/accepted-alerts.tsv
+          today=$(date -u +%F)
+          # Plugin IDs whose acceptance has not expired
+          accepted=$(tr -d '\r' < "$accepted_file" | grep -vE '^[[:space:]]*(#|$)' \
+            | awk -F'\t' -v today="$today" '$3 >= today { print $1 }')
+          echo "Accepted (not expired): ${accepted:-none}"
+          blocking=$(jq -r --arg acc "$accepted" '
+            ($acc | split("\n")) as $ok
+            | [.site[].alerts[]
+               | select((.riskcode | tonumber) >= 2)
+               | select(.pluginid as $p | ($ok | index($p)) | not)
+               | "\(.pluginid)  \(.riskdesc)  \(.name)"]
+            | unique | .[]' "$report")
+          if [ -n "$blocking" ]; then
+            echo "::error::New ZAP alerts of risk Medium or higher:"
+            echo "$blocking"
+            exit 1
+          fi
+          echo "No new Medium or higher ZAP alert."
+
+      - name: Collect cluster evidence on failure
+        if: failure()
+        run: |
+          mkdir -p k8s-evidence
+          kubectl get all,events,networkpolicy -n "$NAMESPACE" -o wide > k8s-evidence/get.txt 2>&1 || true
+          kubectl describe pods -n "$NAMESPACE" > k8s-evidence/describe-pods.txt 2>&1 || true
+          kubectl logs -n "$NAMESPACE" deployment/juice-shop --all-containers > k8s-evidence/logs.txt 2>&1 || true
+          cp port-forward.log k8s-evidence/ 2>/dev/null || true
+
+      - name: Keep the cluster evidence as an artifact
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: k8s-evidence
+          path: k8s-evidence/
+          retention-days: 30
+
+      - name: Keep the ZAP reports as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zap-reports
+          path: zap/
+          retention-days: 30
+
+      - name: Delete the staging cluster
+        if: always()
+        run: kind delete cluster --name "$CLUSTER" || true
+
+  # ---------------------------------------------------------------------------
+  # Notification (brief §6): email the team when any job of this run fails.
+  # Sent with curl over SMTP with STARTTLS required: no third-party action, and
+  # the password never travels in clear text. The job has no GitHub token at
+  # all (permissions: {}). Secrets: SMTP_USERNAME, SMTP_PASSWORD (an app
+  # password, not the account password), NOTIFY_EMAIL_TO (comma-separated);
+  # the addresses are secrets so they stay out of this public repo and its logs.
+  # ---------------------------------------------------------------------------
+  notify:
+    name: Notify on failure (email)
+    needs: [iac_scan, sca, sbom, image, sign, deploy_staging]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Send failure email
+        env:
+          SMTP_SERVER: smtp.gmail.com:587
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+          NEEDS: ${{ toJSON(needs) }}
+          WORKFLOW: ${{ github.workflow }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.head_ref || github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$SMTP_USERNAME" ] || [ -z "$SMTP_PASSWORD" ] || [ -z "$NOTIFY_EMAIL_TO" ]; then
+            echo "::warning::Email secrets are not set: no notification sent"
+            exit 0
+          fi
+          # Jobs of this run that failed (from the needs context)
+          failed=$(jq -r 'to_entries[] | select(.value.result == "failure") | "  - " + .key' <<< "$NEEDS")
+          # Single-line values only, so nothing can be injected into the mail headers
+          ref=$(printf '%s' "$REF_NAME" | tr -d '\r\n')
+          title=$(printf '%s' "$PR_TITLE" | tr -d '\r\n')
+          {
+            echo "From: DevSecOps pipeline <$SMTP_USERNAME>"
+            echo "To: $NOTIFY_EMAIL_TO"
+            echo "Subject: [FAILED] $WORKFLOW on $ref"
+            echo "Date: $(date -R)"
+            echo "MIME-Version: 1.0"
+            echo "Content-Type: text/plain; charset=UTF-8"
+            echo
+            echo "The \"$WORKFLOW\" pipeline failed."
+            echo
+            echo "Repository: $REPOSITORY"
+            echo "Branch:     $ref"
+            [ -n "$title" ] && echo "Pull request: $title"
+            echo "Event:      $EVENT, by $ACTOR"
+            echo "Commit:     $SHA"
+            echo
+            echo "Failed job(s):"
+            echo "$failed"
+            echo
+            echo "Logs and reports: $RUN_URL"
+          } > mail.txt
+          # One --mail-rcpt per address in NOTIFY_EMAIL_TO (comma-separated)
+          rcpt=()
+          count=0
+          IFS=',' read -ra addrs <<< "$NOTIFY_EMAIL_TO"
+          for a in "${addrs[@]}"; do
+            a=$(printf '%s' "$a" | tr -d '[:space:]')
+            if [ -n "$a" ]; then
+              rcpt+=(--mail-rcpt "$a")
+              count=$((count + 1))
+            fi
+          done
+          # SMTP with STARTTLS required: the password is never sent in clear text
+          curl --silent --show-error --ssl-reqd \
+            --url "smtp://$SMTP_SERVER" \
+            --user "$SMTP_USERNAME:$SMTP_PASSWORD" \
+            --mail-from "$SMTP_USERNAME" "${rcpt[@]}" \
+            --upload-file mail.txt
+          echo "Failure email sent to $count recipient(s)."
