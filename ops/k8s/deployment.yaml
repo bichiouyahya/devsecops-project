@@ -1,0 +1,126 @@
+# Hardened Deployment for OWASP Juice Shop (staging).
+#
+# - Image by DIGEST, never by tag. The digest below is a valid default; the
+#   deploy_staging job replaces it with the digest it has just verified with
+#   Cosign, so only a signed image is ever deployed.
+# - Non-root (UID 65532, same as the Dockerfile's USER), no privilege
+#   escalation, all capabilities dropped, RuntimeDefault seccomp profile.
+# - Read-only root filesystem. Juice Shop rewrites some files at startup to
+#   apply its configuration (database, translations, index.html, images,
+#   ftp/legal.md, CSAF metadata) and writes logs, so exactly those folders are
+#   writable emptyDir volumes. An init container first copies the image's
+#   original files into them (with the image's own Node.js: distroless has no
+#   shell or cp). This list was measured by tracing every file write of the
+#   real image as UID 65532 with only these folders writable: no other write.
+# - No Kubernetes API token in the pod (the app never calls the API).
+# - Probes on /rest/admin/application-version, the endpoint used by the
+#   Dockerfile HEALTHCHECK.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: juice-shop
+  namespace: juice-shop-staging
+  labels:
+    app: juice-shop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: juice-shop
+  template:
+    metadata:
+      labels:
+        app: juice-shop
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: copy-writable-files
+          image: ghcr.io/bichiouyahya/devsecops-project/juice-shop@sha256:02850cd98718c2e90b2fd01eb1ac5aab203d4690f354a91db1f8d624aca8c703
+          imagePullPolicy: Always
+          command: ["/nodejs/bin/node"]
+          args:
+            - -e
+            - |
+              const fs = require('fs')
+              for (const d of ['data', 'i18n', 'frontend/dist/frontend', 'ftp', '.well-known', 'logs']) {
+                fs.cpSync('/juice-shop/' + d, '/seed/' + d.replace(/\//g, '-'), { recursive: true })
+              }
+              console.log('Writable folders seeded from the image')
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - { name: data, mountPath: /seed/data }
+            - { name: i18n, mountPath: /seed/i18n }
+            - { name: frontend, mountPath: /seed/frontend-dist-frontend }
+            - { name: ftp, mountPath: /seed/ftp }
+            - { name: well-known, mountPath: /seed/.well-known }
+            - { name: logs, mountPath: /seed/logs }
+      containers:
+        - name: juice-shop
+          image: ghcr.io/bichiouyahya/devsecops-project/juice-shop@sha256:02850cd98718c2e90b2fd01eb1ac5aab203d4690f354a91db1f8d624aca8c703
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 3000
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 384Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /rest/admin/application-version
+              port: http
+            periodSeconds: 5
+            failureThreshold: 36 # up to 3 minutes to start
+          readinessProbe:
+            httpGet:
+              path: /rest/admin/application-version
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /rest/admin/application-version
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          volumeMounts:
+            - { name: data, mountPath: /juice-shop/data }
+            - { name: i18n, mountPath: /juice-shop/i18n }
+            - { name: frontend, mountPath: /juice-shop/frontend/dist/frontend }
+            - { name: ftp, mountPath: /juice-shop/ftp }
+            - { name: well-known, mountPath: /juice-shop/.well-known }
+            - { name: logs, mountPath: /juice-shop/logs }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: data, emptyDir: { sizeLimit: 64Mi } }
+        - { name: i18n, emptyDir: { sizeLimit: 32Mi } }
+        - { name: frontend, emptyDir: { sizeLimit: 128Mi } }
+        - { name: ftp, emptyDir: { sizeLimit: 16Mi } }
+        - { name: well-known, emptyDir: { sizeLimit: 1Mi } }
+        - { name: logs, emptyDir: { sizeLimit: 64Mi } }
+        - { name: tmp, emptyDir: { sizeLimit: 64Mi } }

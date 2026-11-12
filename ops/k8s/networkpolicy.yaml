@@ -1,0 +1,30 @@
+# Network policies: deny everything by default, then allow only HTTP to the
+# app on port 3000. Juice Shop needs no outbound traffic, so egress stays denied.
+# Note: whether these are enforced depends on the cluster's network plugin;
+# in any case they document and version the intended network exposure.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: juice-shop-staging
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-http-to-juice-shop
+  namespace: juice-shop-staging
+spec:
+  podSelector:
+    matchLabels:
+      app: juice-shop
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 3000

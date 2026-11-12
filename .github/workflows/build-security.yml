@@ -6,7 +6,9 @@
 #   sbom      Task 3: software bill of materials (Syft, CycloneDX)
 #   image     Task 4: build the container image, scan it (Trivy), push to GHCR
 #   sign      Task 5: sign the image by digest and verify it (Cosign)
-#   dast      Task 6: attack the running app with OWASP ZAP (baseline scan)
+#   deploy_staging  Task 6 + Ops: verify the signature (deploy gate), deploy the
+#             image by digest to an ephemeral Kubernetes staging cluster (kind)
+#             inside the runner, then attack it with OWASP ZAP (baseline scan)
 #
 # Quality gates (policy and reasons: docs/quality-gates.md):
 #   - Every scan first writes its full report (Security tab + artifact), then a
@@ -17,8 +19,10 @@
 #   - sca/image block on CRITICAL vulnerabilities that have a fix, except the
 #               accepted ones in .trivyignore (reason + expiry date each)
 #   - sign      blocks on a missing or invalid signature
-#   - dast      blocks on ZAP alerts of risk Medium or higher, except the
+#   - deploy_staging  refuses to deploy an image without a valid signature, and
+#               blocks on ZAP alerts of risk Medium or higher, except the
 #               accepted ones in .zap/accepted-alerts.tsv
+#   - iac_scan  also blocks on any Checkov failure in ops/k8s/ (we deploy it)
 #   Accepted findings follow docs/exemption-process.md.
 #
 # Rules (team handover):
@@ -54,7 +58,8 @@ env:
 jobs:
   # ---------------------------------------------------------------------------
   # Task 1: Dockerfile linting (Hadolint) + IaC scanning (Checkov)
-  # Scans: Dockerfile, infrastructure/Dockerfile, terraform/, infrastructure/terraform/
+  # Scans: Dockerfile, infrastructure/Dockerfile, terraform/, infrastructure/terraform/,
+  #        and our Kubernetes manifests in ops/k8s/
   # ---------------------------------------------------------------------------
   iac_scan:
     name: iac_scan (Hadolint + Checkov)
@@ -82,13 +87,13 @@ jobs:
           docker run --rm -v "$PWD:/src" -w /src "$HADOLINT_IMAGE" \
             /bin/hadolint --failure-threshold warning Dockerfile infrastructure/Dockerfile
 
-      - name: Checkov (Dockerfile, Terraform, secrets)
+      - name: Checkov (Dockerfile, Terraform, Kubernetes, secrets)
         # Report only (--soft-fail): the upstream Terraform and infrastructure/Dockerfile
-        # describe an AWS setup we do not deploy. The gate is the next step.
+        # describe an AWS setup we do not deploy. The gates are the next steps.
         # Writes reports/results_cli.txt and reports/results_sarif.sarif
         run: |
           docker run --rm -v "$PWD:/src" -w /src "$CHECKOV_IMAGE" \
-            -d . --framework dockerfile,secrets,terraform \
+            -d . --framework dockerfile,kubernetes,secrets,terraform \
             -o cli -o sarif --output-file-path reports \
             --soft-fail --quiet --compact
           cat reports/results_cli.txt
@@ -98,6 +103,12 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/src" -w /src "$CHECKOV_IMAGE" \
             -f Dockerfile --framework dockerfile --quiet --compact
+
+      - name: Checkov gate (the Kubernetes manifests we deploy)
+        # GATE (blocking): any failed Checkov check on ops/k8s/ fails the build.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$CHECKOV_IMAGE" \
+            -d ops/k8s --framework kubernetes --quiet --compact
 
       - name: Upload Hadolint results to GitHub Security tab
         if: always()
@@ -476,54 +487,133 @@ jobs:
         run: docker logout ghcr.io
 
   # ---------------------------------------------------------------------------
-  # Task 6: DAST, attack the running application with OWASP ZAP
+  # Task 6 + Ops: staging deployment with a deploy-time signature gate, then DAST
   #
-  # Finds what static tools cannot see: missing security headers, exposed
-  # paths, cookies, runtime error pages. Runs only after the image has been
-  # signed and verified, against that exact image (by digest).
+  # An ephemeral Kubernetes cluster (kind) is created INSIDE the GitHub-hosted
+  # runner and deleted at the end of the job: nothing is ever public, nothing
+  # runs on our PCs, and no self-hosted runner is needed (this repo is public).
   #
-  # Baseline mode only (passive: spiders the app and inspects the responses,
-  # no attack payloads), and only against the container started inside this
-  # job on localhost. Never point this job at any other host.
+  # 1. Deploy gate: `cosign verify` of the image digest BEFORE any kubectl apply.
+  #    No valid signature = nothing is deployed.
+  # 2. Negative test: the same gate must refuse the unsigned upstream image.
+  # 3. Deploy the hardened manifests of ops/k8s/ with the verified DIGEST
+  #    (never a tag), wait for the rollout.
+  # 4. DAST: OWASP ZAP baseline (passive) against the deployed Service through
+  #    kubectl port-forward on the runner's 127.0.0.1.
+  # Tool versions: kind, its node image and kubectl pinned below, binaries
+  # checked against the SHA-256 recorded here before they run.
   # ---------------------------------------------------------------------------
-  dast:
-    name: dast (OWASP ZAP baseline)
+  deploy_staging:
+    name: deploy_staging (verify signature, deploy to kind, ZAP)
     needs: [image, sign]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
-      packages: read # pull our image from GHCR
+      packages: read
+    env:
+      KIND_VERSION: v0.33.0
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+      KIND_NODE_IMAGE: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+      KUBECTL_VERSION: v1.37.2
+      KUBECTL_SHA256: c04487523e7aa7d1493f7808174c899db93d7a9cf57531420cd76b9bd415f8f4
+      CLUSTER: staging
+      NAMESPACE: juice-shop-staging
+      DIGEST: ${{ needs.image.outputs.digest }}
     steps:
-      - name: Checkout (for .zap/accepted-alerts.tsv)
+      - name: Checkout (manifests, cosign.pub, ZAP accepted alerts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Pull the signed image from GHCR
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GHCR_USER: ${{ github.actor }}
-          DIGEST: ${{ needs.image.outputs.digest }}
+      - name: Install Cosign, kind and kubectl (checksums verified)
         run: |
-          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-          docker pull "$APP_IMAGE@$DIGEST"
-          docker logout ghcr.io
+          base="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}"
+          curl -sSfL -o cosign-linux-amd64 "$base/cosign-linux-amd64"
+          curl -sSfL -o cosign_checksums.txt "$base/cosign_checksums.txt"
+          grep -E " cosign-linux-amd64$" cosign_checksums.txt | sha256sum --check
+          sudo install -m 0755 cosign-linux-amd64 /usr/local/bin/cosign
 
-      - name: Start Juice Shop and wait until it answers on port 3000
-        env:
-          DIGEST: ${{ needs.image.outputs.digest }}
+          curl -sSfL -o kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  kind" | sha256sum --check
+          sudo install -m 0755 kind /usr/local/bin/kind
+
+          curl -sSfL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  kubectl" | sha256sum --check
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+
+          rm -f cosign-linux-amd64 cosign_checksums.txt kind kubectl
+          cosign version | grep GitVersion; kind version; kubectl version --client
+
+      - name: Deploy gate, verify the signature before deploying
+        # GATE (blocking): no valid signature from cosign.pub = the job stops here
+        # and nothing is deployed.
         run: |
-          docker run -d --name juice -p 127.0.0.1:3000:3000 "$APP_IMAGE@$DIGEST"
-          for i in $(seq 1 60); do
-            if curl -fsS -o /dev/null http://127.0.0.1:3000; then
-              echo "Juice Shop is up after $((i * 2)) seconds"
+          cosign verify --key cosign.pub "$APP_IMAGE@$DIGEST" | jq .
+          {
+            echo "### Deploy gate: signature verified"
+            echo "- Image: \`$APP_IMAGE@$DIGEST\`"
+            echo "- Key: \`cosign.pub\` from the repository"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Negative test, the deploy gate refuses an unsigned image
+        # The unsigned upstream image must be refused for the RIGHT reason
+        # ("no signatures found"), otherwise the gate proves nothing.
+        run: |
+          if out=$(cosign verify --key cosign.pub docker.io/bkimminich/juice-shop:latest 2>&1); then
+            echo "$out"
+            echo "::error::The deploy gate accepted an image that we did not sign"
+            exit 1
+          fi
+          echo "$out"
+          if ! grep -q "no signatures found" <<< "$out"; then
+            echo "::error::Verification failed for an unexpected reason (see the output above)"
+            exit 1
+          fi
+          echo "As expected: the unsigned image was refused, it would never be deployed."
+          echo "- Unsigned image \`bkimminich/juice-shop\`: refused by the deploy gate" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create the staging cluster (kind, inside this runner only)
+        run: |
+          kind create cluster --name "$CLUSTER" --image "$KIND_NODE_IMAGE" --wait 120s
+          kubectl cluster-info
+          kubectl get nodes -o wide
+
+      - name: Deploy the verified image by digest
+        run: |
+          mkdir -p rendered
+          cp ops/k8s/*.yaml rendered/
+          # Replace the default digest with the one verified above (never a tag)
+          sed -E -i "s#ghcr\.io/[^@[:space:]]+/juice-shop@sha256:[0-9a-f]{64}#${APP_IMAGE}@${DIGEST}#g" rendered/deployment.yaml
+          n=$(grep -c "${APP_IMAGE}@${DIGEST}" rendered/deployment.yaml)
+          if [ "$n" -ne 2 ]; then
+            echo "::error::Expected the verified digest in 2 places (init container + app), found $n"
+            exit 1
+          fi
+          kubectl apply -f rendered/namespace.yaml
+          kubectl apply -f rendered/
+          kubectl -n "$NAMESPACE" rollout status deployment/juice-shop --timeout=300s
+          kubectl -n "$NAMESPACE" get pods,svc,networkpolicy -o wide
+          {
+            echo "### Staging deployment"
+            echo "- Cluster: ephemeral kind cluster \`$CLUSTER\` inside the runner"
+            echo "- Deployed: \`$APP_IMAGE@$DIGEST\` (signature verified above)"
+            echo "- Namespace \`$NAMESPACE\`: Pod Security \"restricted\", read-only root filesystem, non-root, no capabilities"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Expose staging on the runner's localhost for ZAP
+        run: |
+          nohup kubectl -n "$NAMESPACE" port-forward svc/juice-shop 3000:3000 \
+            --address 127.0.0.1 > port-forward.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:3000/rest/admin/application-version; then
+              echo "Staging answers on 127.0.0.1:3000 after $((i * 2)) seconds"
               exit 0
             fi
             sleep 2
           done
-          echo "::error::Juice Shop did not start within 2 minutes"
-          docker logs juice
+          echo "::error::Staging is not reachable through port-forward"
+          cat port-forward.log
           exit 1
 
       - name: ZAP baseline scan
@@ -543,7 +633,7 @@ jobs:
             exit 1
           fi
           {
-            echo "### ZAP baseline scan (exit code $code)"
+            echo "### ZAP baseline scan against staging (exit code $code)"
             cat zap/zap-report.md
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -572,9 +662,22 @@ jobs:
           fi
           echo "No new Medium or higher ZAP alert."
 
-      - name: Stop Juice Shop
-        if: always()
-        run: docker rm -f juice || true
+      - name: Collect cluster evidence on failure
+        if: failure()
+        run: |
+          mkdir -p k8s-evidence
+          kubectl get all,events,networkpolicy -n "$NAMESPACE" -o wide > k8s-evidence/get.txt 2>&1 || true
+          kubectl describe pods -n "$NAMESPACE" > k8s-evidence/describe-pods.txt 2>&1 || true
+          kubectl logs -n "$NAMESPACE" deployment/juice-shop --all-containers > k8s-evidence/logs.txt 2>&1 || true
+          cp port-forward.log k8s-evidence/ 2>/dev/null || true
+
+      - name: Keep the cluster evidence as an artifact
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: k8s-evidence
+          path: k8s-evidence/
+          retention-days: 30
 
       - name: Keep the ZAP reports as an artifact
         if: always()
@@ -583,6 +686,10 @@ jobs:
           name: zap-reports
           path: zap/
           retention-days: 30
+
+      - name: Delete the staging cluster
+        if: always()
+        run: kind delete cluster --name "$CLUSTER" || true
 
   # ---------------------------------------------------------------------------
   # Notification (brief §6): email the team when any job of this run fails.
@@ -594,7 +701,7 @@ jobs:
   # ---------------------------------------------------------------------------
   notify:
     name: Notify on failure (email)
-    needs: [iac_scan, sca, sbom, image, sign, dast]
+    needs: [iac_scan, sca, sbom, image, sign, deploy_staging]
     if: failure()
     runs-on: ubuntu-latest
     timeout-minutes: 5
