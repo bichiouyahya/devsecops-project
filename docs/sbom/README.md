@@ -1,7 +1,7 @@
 # SBOM: software bill of materials
 
-Task 3 (Person B). Produced by the `sbom` job in `.github/workflows/build-security.yml`
-on every pull request and push to `main`, and kept as the `sbom` workflow
+Task 3 (Person B). Produced by the `sbom` job (stage 6, release checks) of
+`.github/workflows/devsecops.yml` on every pull request and push to `main`, and kept as the `sbom` workflow
 artifact (`sbom.cdx.json`, 90 days).
 
 ## What the SBOM contains

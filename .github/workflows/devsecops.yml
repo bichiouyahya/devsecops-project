@@ -1,0 +1,1167 @@
+# DevSecOps pipeline for OWASP Juice Shop: one workflow, ten stages.
+#
+# Each stage starts only when every job of the previous stage has passed
+# (`needs`), so the graph of a run reads left to right like the pipeline:
+#
+#   1 Secrets        Gitleaks
+#   2 Static checks  SAST (Semgrep, CodeQL, SonarQube Cloud), SCA (Trivy,
+#                    npm audit), IaC (Hadolint, Checkov)
+#   3 Build          install the dependencies, compile the TypeScript server
+#   4 Tests          server unit tests, security tests (attacks on the API)
+#   5 Package        build the Docker image
+#   6 Release checks Trivy image scan, SBOM (Syft, CycloneDX)
+#   7 Publish        push the scanned image to GHCR
+#   8 Sign           Cosign signature of the image digest, then verification
+#   9 Deploy + DAST  signature checked again at deploy time, deployment to an
+#                    ephemeral Kubernetes staging (kind), OWASP ZAP scan
+#  10 Notify         email to the team if any job failed
+#
+# Quality gates. Every scan first writes its full report (Security tab +
+# artifact); a separate step marked "GATE (blocking)" then decides whether the
+# job fails:
+#   Gitleaks   any secret not triaged in .gitleaksignore
+#   Semgrep    a new ERROR finding added by the pull request
+#   CodeQL     GitHub check "Code scanning results / CodeQL": a new High+ alert
+#   SonarQube  quality gate "Sonar way" on new code (pull requests)
+#   Trivy      CRITICAL vulnerability with a fix, not accepted in .trivyignore
+#              (dependencies in stage 2, the image in stage 6)
+#   Hadolint   warning or error; Checkov: any failure in the Dockerfile we ship
+#              and in ops/k8s/ (the manifests we deploy)
+#   Build      compile error; Tests: any failing unit or security test
+#   SBOM       missing, invalid or empty inventory
+#   Cosign     missing or invalid signature (after signing, and at deploy time)
+#   ZAP        new alert of risk Medium or higher, not accepted in
+#              .zap/accepted-alerts.tsv
+# Accepted findings are reviewed and listed in .gitleaksignore (fingerprints),
+# .trivyignore and .zap/accepted-alerts.tsv (each with a reason and an expiry date).
+#
+# Rules (team handover):
+#   - Actions pinned by commit SHA, images pinned by digest, never by tag.
+#   - Least privilege: read only by default, each job asks for what it needs.
+#   - persist-credentials: false on every checkout.
+
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new commit on a pull request cancels the older run of that pull request
+concurrency:
+  group: devsecops-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  SEMGREP_VERSION: 1.183.0
+  HADOLINT_IMAGE: hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
+  CHECKOV_IMAGE: bridgecrew/checkov:3.3.29@sha256:3cc125b5337717b7303dbddd4e79374c120687b5ff6a24f9abdad56b562469f3
+  TRIVY_IMAGE: aquasec/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222
+  SYFT_IMAGE: anchore/syft:v1.55.0@sha256:4cc92b64ca74ffca4c94d4c8fcc01f217731375300be14d0b6eeb2e82eaa110a
+  # Our own image in GitHub Container Registry (repository name is lowercase)
+  APP_IMAGE: ghcr.io/${{ github.repository }}/juice-shop
+  COSIGN_VERSION: v3.1.4
+  ZAP_IMAGE: ghcr.io/zaproxy/zaproxy:2.17.0@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1: secrets. Gitleaks scans the whole Git history.
+  # ---------------------------------------------------------------------------
+  secrets:
+    name: Secrets (Gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write   # upload SARIF to the Security tab
+    steps:
+      # Actions pinned by commit SHA, not by tag (supply chain rule from the course)
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # scan every commit, not only the last one
+          persist-credentials: false
+
+      - name: Install Gitleaks (checksum verified)
+        run: |
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          # HTTPS only, including after redirects, then checksum verified
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o "$tarball" "$base/$tarball"
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o checksums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          sha256sum --check --ignore-missing checksums.txt
+          tar -xzf "$tarball" gitleaks
+          sudo mv gitleaks /usr/local/bin/
+          gitleaks version
+
+      - name: Gitleaks gate (whole Git history)
+        # GATE (blocking): any secret not triaged in .gitleaksignore fails the build.
+        # Test fixtures are excluded in .gitleaks.toml.
+        run: |
+          gitleaks git . --config .gitleaks.toml --redact --verbose \
+            --report-format sarif --report-path gitleaks.sarif \
+            --exit-code 1
+
+      - name: Write JSON report
+        # Same scan, same baseline, as JSON (Gitleaks writes one format per run).
+        if: always()
+        run: |
+          gitleaks git . --config .gitleaks.toml --redact \
+            --report-format json --report-path gitleaks.json \
+            --exit-code 0
+
+      - name: Upload report as artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gitleaks-report
+          path: |
+            gitleaks.sarif
+            gitleaks.json
+
+      - name: Upload to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: static checks, in parallel: SAST (Semgrep, CodeQL, SonarQube Cloud),
+  # SCA (Trivy, npm audit) and IaC (Hadolint, Checkov).
+  # ---------------------------------------------------------------------------
+  sast_semgrep:
+    name: SAST (Semgrep)
+    needs: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # the gate compares with the base branch
+          persist-credentials: false
+
+      - name: Install Semgrep (pinned version)
+        run: |
+          pipx install "semgrep==${SEMGREP_VERSION}"
+          semgrep --version
+
+      - name: Scan source code (full report)
+        # Report only: every finding goes to the Security tab and the artifact.
+        # The reports are written outside the checkout, so the tree stays clean
+        # for the gate below (--baseline-commit needs a clean tree).
+        run: |
+          mkdir -p "$RUNNER_TEMP/semgrep"
+          semgrep scan \
+            --config p/javascript \
+            --config p/typescript \
+            --config p/nodejsscan \
+            --config p/owasp-top-ten \
+            --metrics off \
+            --sarif --output "$RUNNER_TEMP/semgrep/semgrep.sarif" \
+            --json-output "$RUNNER_TEMP/semgrep/semgrep.json" \
+            --text-output "$RUNNER_TEMP/semgrep/semgrep.txt"
+          tail -n 40 "$RUNNER_TEMP/semgrep/semgrep.txt" || true
+
+      - name: Semgrep gate (new ERROR findings in this pull request)
+        # GATE (blocking) on pull requests: a finding of severity ERROR that the
+        # pull request ADDS fails the job. --baseline-commit hides the findings
+        # already on the base branch (Juice Shop is vulnerable by design), same
+        # rule as scripts/security-scan.sh. On pushes to main: report only.
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          base=$(git merge-base "origin/$BASE_REF" HEAD)
+          echo "Compared with $BASE_REF at $base"
+          semgrep scan \
+            --config p/javascript \
+            --config p/typescript \
+            --config p/nodejsscan \
+            --config p/owasp-top-ten \
+            --metrics off --error --severity ERROR \
+            --baseline-commit "$base"
+
+      - name: Upload report as artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: semgrep-report
+          path: ${{ runner.temp }}/semgrep/
+
+      - name: Upload to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          sarif_file: ${{ runner.temp }}/semgrep/semgrep.sarif
+          category: semgrep
+
+  # ---------------------------------------------------------------------------
+  # CodeQL: GitHub computes its gate, the check "Code scanning results / CodeQL"
+  # (required on main), which fails when a pull request adds a security alert of
+  # severity High or higher. This job runs the analysis.
+  # ---------------------------------------------------------------------------
+  sast_codeql:
+    name: SAST (CodeQL)
+    needs: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          queries: security-extended   # broader security query suite
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          category: codeql
+
+  # ---------------------------------------------------------------------------
+  # SonarQube Cloud: settings in sonar-project.properties. On pull requests the
+  # job waits for the quality gate "Sonar way" and fails if the gate fails.
+  # ---------------------------------------------------------------------------
+  sast_sonarqube:
+    name: SAST (SonarQube Cloud)
+    needs: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # SonarQube needs the history to tell new code from old code
+          persist-credentials: false
+
+      - name: SonarQube Cloud scan and quality gate
+        # Settings (organization, project key, exclusions) are in sonar-project.properties.
+        # Quality gate "Sonar way" on new code. On pull requests the job waits for the
+        # gate result and fails if the gate fails, so this check can be required on main.
+        uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304 # v8.4.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >-
+            ${{ github.event_name == 'pull_request' && '-Dsonar.qualitygate.wait=true -Dsonar.qualitygate.timeout=600' || '' }}
+
+  # ---------------------------------------------------------------------------
+  # SCA. Juice Shop ships WITHOUT a lockfile (.npmrc: package-lock=false), so
+  # both scanners first resolve one, without installing anything and without
+  # running install scripts.
+  # ---------------------------------------------------------------------------
+  sca:
+    name: SCA (Trivy + npm audit)
+    needs: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Resolve dependency tree (generate lockfiles, no install)
+        # --package-lock-only : write package-lock.json, do not download packages
+        # --ignore-scripts    : never run third-party install scripts in CI
+        run: |
+          npm install --package-lock-only --package-lock=true \
+            --ignore-scripts --no-audit --no-fund
+          cd frontend
+          npm install --package-lock-only --package-lock=true \
+            --ignore-scripts --no-audit --no-fund --legacy-peer-deps
+
+      - name: Trivy filesystem scan (HIGH, CRITICAL)
+        # Report only. --ignorefile /dev/null: the reports show EVERY finding,
+        # including the accepted ones; only the gate step applies .trivyignore.
+        run: |
+          mkdir -p reports "$RUNNER_TEMP/trivy-cache"
+          # Shared cache: the vulnerability database is downloaded only once
+          trivy() {
+            docker run --rm -v "$PWD:/src" -w /src \
+              -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+              "$TRIVY_IMAGE" "$@"
+          }
+          # Readable table in the job log
+          trivy fs --scanners vuln --severity HIGH,CRITICAL --ignorefile /dev/null \
+            --format table --exit-code 0 .
+          # SARIF for the Security tab, JSON (all severities) for the comparison table
+          trivy fs --scanners vuln --severity HIGH,CRITICAL --ignorefile /dev/null \
+            --skip-db-update --format sarif --output reports/trivy-fs.sarif .
+          trivy fs --scanners vuln --ignorefile /dev/null --skip-db-update \
+            --format json --output reports/trivy-fs.json .
+
+      - name: npm audit (second opinion, for the tool comparison)
+        # Report only: Trivy is the gate (docs/sca/tool-comparison.md explains why).
+        run: |
+          echo "### Backend (production dependencies)"
+          npm audit --omit=dev --audit-level=high || true
+          npm audit --omit=dev --json > reports/npm-audit-backend.json || true
+          echo "### Frontend"
+          cd frontend
+          npm audit --audit-level=high || true
+          npm audit --json > ../reports/npm-audit-frontend.json || true
+
+      - name: Trivy gate (CRITICAL with a fix available)
+        # GATE (blocking): fails on any CRITICAL vulnerability that has a fixed
+        # version, except the accepted ones in .trivyignore. Unfixable CRITICALs
+        # are reported above but do not block: nobody could act on them.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" fs --scanners vuln --skip-db-update \
+            --severity CRITICAL --ignore-unfixed --ignorefile .trivyignore \
+            --exit-code 1 --format table .
+
+      - name: Upload Trivy results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          sarif_file: reports/trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Keep the reports and generated lockfiles as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sca-reports
+          path: |
+            reports/
+            package-lock.json
+            frontend/package-lock.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # IaC: Dockerfile best practices (Hadolint) and misconfigurations (Checkov).
+  # ---------------------------------------------------------------------------
+  iac_scan:
+    name: IaC (Hadolint + Checkov)
+    needs: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # upload SARIF to the Security tab
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Hadolint (Dockerfile best practices)
+        # GATE (blocking): fails on any warning or error. Info notes (for example
+        # DL3059 "consecutive RUN") are style advice and do not block.
+        run: |
+          mkdir -p reports
+          # SARIF for the Security tab (all findings, never fails)
+          docker run --rm -v "$PWD:/src" -w /src "$HADOLINT_IMAGE" \
+            /bin/hadolint --no-fail -f sarif Dockerfile infrastructure/Dockerfile \
+            > reports/hadolint.sarif
+          # Readable output in the job log + gate
+          docker run --rm -v "$PWD:/src" -w /src "$HADOLINT_IMAGE" \
+            /bin/hadolint --failure-threshold warning Dockerfile infrastructure/Dockerfile
+
+      - name: Checkov (Dockerfile, Terraform, Kubernetes, secrets)
+        # Report only (--soft-fail): the upstream Terraform and infrastructure/Dockerfile
+        # describe an AWS setup we do not deploy. The gates are the next steps.
+        # Writes reports/results_cli.txt and reports/results_sarif.sarif
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$CHECKOV_IMAGE" \
+            -d . --framework dockerfile,kubernetes,secrets,terraform \
+            -o cli -o sarif --output-file-path reports \
+            --soft-fail --quiet --compact
+          cat reports/results_cli.txt
+
+      - name: Checkov gate (the Dockerfile we ship)
+        # GATE (blocking): any failed Checkov check on ./Dockerfile fails the build.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$CHECKOV_IMAGE" \
+            -f Dockerfile --framework dockerfile --quiet --compact
+
+      - name: Checkov gate (the Kubernetes manifests we deploy)
+        # GATE (blocking): any failed Checkov check on ops/k8s/ fails the build.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$CHECKOV_IMAGE" \
+            -d ops/k8s --framework kubernetes --quiet --compact
+
+      - name: Upload Hadolint results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          sarif_file: reports/hadolint.sarif
+          category: hadolint
+
+      - name: Upload Checkov results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          sarif_file: reports/results_sarif.sarif
+          category: checkov
+
+      - name: Keep the reports as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: iac-scan-reports
+          path: reports/
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Stage 3: build. Install the dependencies and compile the TypeScript server.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (compile TypeScript)
+    needs: [sast_semgrep, sast_codeql, sast_sonarqube, sca, iac_scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js (same major version as the Docker image)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies (no install scripts)
+        # No lockfile in Juice Shop, so npm install (not npm ci). --ignore-scripts:
+        # third-party install scripts never run, and the postinstall Angular build
+        # (which crashes npm on GitHub runners) is skipped; the frontend is
+        # compiled inside the Docker build of the package stage.
+        run: |
+          npm install --no-audit --no-fund --ignore-scripts
+          npm rebuild sqlite3
+
+      - name: Compile the server (tsc)
+        # GATE (blocking): a compile error stops the pipeline here.
+        run: npx tsc
+
+      - name: Keep the compiled server as an artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: server-build
+          path: build/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Stage 4: tests, in parallel. Juice Shop server unit tests, and our security
+  # tests (attacks on the running API, test/security/security.test.ts).
+  # ---------------------------------------------------------------------------
+  unit_tests:
+    name: Unit tests (server)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js (same major version as the Docker image)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies (no install scripts)
+        # No lockfile in Juice Shop, so npm install (not npm ci). --ignore-scripts:
+        # third-party install scripts never run, and the postinstall Angular build
+        # (which crashes npm on GitHub runners) is skipped; the frontend is
+        # compiled inside the Docker build of the package stage.
+        run: |
+          npm install --no-audit --no-fund --ignore-scripts
+          npm rebuild sqlite3
+
+      - name: Run the server unit tests
+        # GATE (blocking): any failing unit test fails the job.
+        run: |
+          node --import ./test/server/helpers/test-env.mjs --import tsx --test --test-force-exit \
+            --test-reporter=spec --test-reporter-destination=stdout \
+            --test-reporter=junit --test-reporter-destination=unit-tests.xml \
+            "test/server/**/*.unit.test.ts"
+
+      - name: Keep the test report as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unit-tests-report
+          path: unit-tests.xml
+          retention-days: 30
+
+
+  security_tests:
+    name: Security tests (API attacks)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js (same major version as the Docker image)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies (no install scripts)
+        # No lockfile in Juice Shop, so npm install (not npm ci). --ignore-scripts:
+        # third-party install scripts never run, and the postinstall Angular build
+        # (which crashes npm on GitHub runners) is skipped; the frontend is
+        # compiled inside the Docker build of the package stage.
+        run: |
+          npm install --no-audit --no-fund --ignore-scripts
+          npm rebuild sqlite3
+
+      - name: Build server
+        run: npx tsc
+
+      - name: Create placeholder frontend files
+        # The server checks at startup that these files exist. API tests never load them.
+        run: |
+          d=frontend/dist/frontend
+          mkdir -p "$d"
+          for f in index.html styles.css main.js polyfills.js hacking-instructor-placeholder.js; do
+            echo "" > "$d/$f"
+          done
+
+      - name: Run security tests
+        # GATE (blocking): the fixed flaws (SQL injection, JWT alg none) are
+        # regression tests; if one comes back, the job fails. Flaws not fixed yet
+        # are marked "todo" in the test file: reported, not blocking.
+        run: |
+          node --import ./test/api/helpers/test-env.mjs --import tsx --test --test-force-exit \
+            --test-reporter=spec --test-reporter-destination=stdout \
+            --test-reporter=junit --test-reporter-destination=security-tests.xml \
+            --test-reporter=./test/security/json-reporter.mjs --test-reporter-destination=security-tests.json \
+            test/security/security.test.ts
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: security-tests-report
+          path: |
+            security-tests.xml
+            security-tests.json
+
+  # ---------------------------------------------------------------------------
+  # Stage 5: package. Build the Docker image once; the next stages all use this
+  # exact image (passed as an artifact, kept one day).
+  # ---------------------------------------------------------------------------
+  package:
+    name: Package (Docker image)
+    needs: [unit_tests, security_tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the image (tagged with the commit SHA)
+        # Full Juice Shop build (backend + Angular frontend): about 10 minutes.
+        run: |
+          docker build \
+            --build-arg VCS_REF="$GITHUB_SHA" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "$APP_IMAGE:$GITHUB_SHA" .
+          docker image ls "$APP_IMAGE"
+
+      - name: Export the image for the next stages
+        # The scan, SBOM and publish stages all use THIS exact image.
+        run: docker save "$APP_IMAGE:$GITHUB_SHA" -o "$RUNNER_TEMP/image.tar"
+
+      - name: Keep the image as a (short-lived) artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}/image.tar
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Stage 6: release checks, in parallel. Trivy scans the image (it adds OS
+  # packages and layers the source scan cannot see). Syft writes the SBOM of the
+  # release from the resolved dependency tree of the same commit. Juice Shop ships
+  # WITHOUT a lockfile, so the tree is resolved first (no install, no scripts).
+  # ---------------------------------------------------------------------------
+  image_scan:
+    name: Image scan (Trivy)
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the image built by the package stage
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}
+
+      - name: Trivy image scan (HIGH, CRITICAL)
+        # The image is scanned offline from the tar file, so Trivy never gets
+        # access to the Docker socket (that would be root on the runner).
+        # Report only (all findings); the gate is the next step.
+        run: |
+          mkdir -p reports "$RUNNER_TEMP/trivy-cache"
+          trivy() {
+            docker run --rm -v "$PWD:/src" -w /src \
+              -v "$RUNNER_TEMP:/scan:ro" \
+              -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+              "$TRIVY_IMAGE" "$@"
+          }
+          # Readable table in the job log
+          trivy image --input /scan/image.tar --scanners vuln --ignorefile /dev/null \
+            --severity HIGH,CRITICAL --format table --exit-code 0
+          # SARIF for the Security tab, JSON (all severities) for the report
+          trivy image --input /scan/image.tar --scanners vuln --ignorefile /dev/null \
+            --skip-db-update --severity HIGH,CRITICAL \
+            --format sarif --output reports/trivy-image.sarif
+          trivy image --input /scan/image.tar --scanners vuln --ignorefile /dev/null \
+            --skip-db-update --format json --output reports/trivy-image.json
+
+      - name: Trivy image gate (CRITICAL with a fix)
+        # GATE (blocking): same rule as the SCA stage, on what is actually shipped.
+        # The publish stage needs this job, so a failing image never reaches the
+        # registry (and is never signed, deployed or scanned by ZAP).
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            -v "$RUNNER_TEMP:/scan:ro" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" image --input /scan/image.tar --scanners vuln --skip-db-update \
+            --severity CRITICAL --ignore-unfixed --ignorefile .trivyignore \
+            --exit-code 1 --format table
+
+      - name: Upload Trivy results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          sarif_file: reports/trivy-image.sarif
+          category: trivy-image
+
+      - name: Keep the image scan reports as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-scan-reports
+          path: reports/
+          retention-days: 30
+
+
+  sbom:
+    name: SBOM (Syft, CycloneDX)
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Resolve dependency tree (generate lockfiles, no install)
+        run: |
+          npm install --package-lock-only --package-lock=true \
+            --ignore-scripts --no-audit --no-fund
+          cd frontend
+          npm install --package-lock-only --package-lock=true \
+            --ignore-scripts --no-audit --no-fund --legacy-peer-deps
+
+      - name: Generate SBOM with Syft
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$SYFT_IMAGE" \
+            dir:. --source-name juice-shop --source-version "$GITHUB_SHA" \
+            -o cyclonedx-json=sbom.cdx.json
+
+      - name: SBOM gate (valid CycloneDX inventory, not empty)
+        # GATE (blocking): no release without a usable inventory.
+        run: |
+          jq -e '.bomFormat == "CycloneDX" and (.components | length) > 0' sbom.cdx.json > /dev/null \
+            || { echo "::error::The SBOM is not a valid, non-empty CycloneDX document"; exit 1; }
+          n=$(jq '.components | length' sbom.cdx.json)
+          echo "Components in the SBOM: $n"
+          echo "### SBOM: $n components (CycloneDX)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Scan the SBOM with Trivy (bonus)
+        # Vulnerability scan from the inventory alone, no source code needed.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" \
+            sbom --severity HIGH,CRITICAL --format table --exit-code 0 \
+            sbom.cdx.json
+
+      - name: Keep the SBOM as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Stage 7: publish. Only an image that passed every check reaches GHCR. Tagged
+  # with the commit SHA (traceable, never overwritten); the digest is exported.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish (GHCR)
+    needs: [image_scan, sbom]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io with the job's own short-lived token
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Download the image built by the package stage
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}
+
+      - name: Load the scanned image
+        run: |
+          docker load -i "$RUNNER_TEMP/image.tar"
+          docker image ls "$APP_IMAGE"
+
+      - name: Push the image to GHCR
+        id: push
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          docker push "$APP_IMAGE:$GITHUB_SHA"
+          # The digest identifies the exact image content; the sign stage signs this, not the tag
+          ref=$(docker inspect --format='{{index .RepoDigests 0}}' "$APP_IMAGE:$GITHUB_SHA")
+          digest="${ref#*@}"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Image published"
+            echo "- Tag: \`$APP_IMAGE:$GITHUB_SHA\`"
+            echo "- Digest: \`$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          docker logout ghcr.io
+
+  # ---------------------------------------------------------------------------
+  # Stage 8: sign. Cosign signs the DIGEST (the content hash), never the tag,
+  # because a tag can be moved to another image.
+  # Keys: cosign.key + its password are repository secrets COSIGN_PRIVATE_KEY and
+  # COSIGN_PASSWORD (never committed); cosign.pub is committed at the root. The
+  # private key is read from an environment variable (env://), never from disk.
+  # ---------------------------------------------------------------------------
+  sign:
+    name: Sign (Cosign)
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write # push the signature next to the image in GHCR
+    steps:
+      - name: Checkout (for cosign.pub)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Cosign (checksum verified)
+        run: |
+          base="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}"
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o cosign-linux-amd64 "$base/cosign-linux-amd64"
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o cosign_checksums.txt "$base/cosign_checksums.txt"
+          grep -E " cosign-linux-amd64$" cosign_checksums.txt | sha256sum --check
+          sudo install -m 0755 cosign-linux-amd64 /usr/local/bin/cosign
+          rm cosign-linux-amd64 cosign_checksums.txt
+          cosign version
+
+      - name: Check that the signing secrets exist
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          if [ -z "$COSIGN_PRIVATE_KEY" ] || [ -z "$COSIGN_PASSWORD" ]; then
+            echo "::error::Repository secrets COSIGN_PRIVATE_KEY and COSIGN_PASSWORD are not set"
+            exit 1
+          fi
+          test -f cosign.pub || { echo "::error::cosign.pub is missing from the repository"; exit 1; }
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Sign the image by digest
+        # Also records the signature in the public Sigstore transparency log (Rekor),
+        # so anyone can audit when this image was signed.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          echo "Signing $APP_IMAGE@$DIGEST"
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY "$APP_IMAGE@$DIGEST"
+
+      - name: Verify the signature (fails the build if it is missing or invalid)
+        env:
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          cosign verify --key cosign.pub "$APP_IMAGE@$DIGEST" | jq .
+          {
+            echo "### Image signed and verified"
+            echo "- Image: \`$APP_IMAGE@$DIGEST\`"
+            echo "- Verified with \`cosign.pub\` from the repository"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Negative test, an image we did not sign must be rejected
+        # The upstream Juice Shop image from Docker Hub was not signed with our key,
+        # so verification has to fail. If it passed, the check would be worthless.
+        # It must fail for the RIGHT reason ("no signatures found"), not because of a
+        # network error or a registry rate limit, otherwise the test proves nothing.
+        run: |
+          if out=$(cosign verify --key cosign.pub docker.io/bkimminich/juice-shop:latest 2>&1); then
+            echo "$out"
+            echo "::error::An image that we did not sign passed verification"
+            exit 1
+          fi
+          echo "$out"
+          if ! grep -q "no signatures found" <<< "$out"; then
+            echo "::error::Verification failed for an unexpected reason (see the output above)"
+            exit 1
+          fi
+          echo "As expected: the unsigned upstream image was rejected."
+          echo "- Unsigned upstream image \`bkimminich/juice-shop\`: rejected as expected" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
+
+  # ---------------------------------------------------------------------------
+  # Stage 9: deploy to staging, then DAST. An ephemeral Kubernetes cluster (kind)
+  # is created INSIDE the GitHub-hosted runner and deleted at the end of the job:
+  # nothing is public, nothing runs on our PCs, no self-hosted runner.
+  # 1. Deploy gate: cosign verify of the digest BEFORE any kubectl apply.
+  # 2. Negative test: the same gate must refuse the unsigned upstream image.
+  # 3. Deploy the hardened manifests of ops/k8s/ by DIGEST, wait for the rollout.
+  # 4. DAST: OWASP ZAP baseline against the deployed Service (port-forward).
+  # ---------------------------------------------------------------------------
+  deploy_staging:
+    name: Deploy staging + DAST (kind, ZAP)
+    needs: [publish, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    env:
+      KIND_VERSION: v0.33.0
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+      KIND_NODE_IMAGE: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+      KUBECTL_VERSION: v1.37.2
+      KUBECTL_SHA256: c04487523e7aa7d1493f7808174c899db93d7a9cf57531420cd76b9bd415f8f4
+      CLUSTER: staging
+      NAMESPACE: juice-shop-staging
+      DIGEST: ${{ needs.publish.outputs.digest }}
+    steps:
+      - name: Checkout (manifests, cosign.pub, ZAP accepted alerts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Cosign, kind and kubectl (checksums verified)
+        run: |
+          base="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}"
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o cosign-linux-amd64 "$base/cosign-linux-amd64"
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o cosign_checksums.txt "$base/cosign_checksums.txt"
+          grep -E " cosign-linux-amd64$" cosign_checksums.txt | sha256sum --check
+          sudo install -m 0755 cosign-linux-amd64 /usr/local/bin/cosign
+
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  kind" | sha256sum --check
+          sudo install -m 0755 kind /usr/local/bin/kind
+
+          curl -sSfL --proto '=https' --proto-redir '=https' --tlsv1.2 -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  kubectl" | sha256sum --check
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+
+          rm -f cosign-linux-amd64 cosign_checksums.txt kind kubectl
+          cosign version | grep GitVersion; kind version; kubectl version --client
+
+      - name: Deploy gate, verify the signature before deploying
+        # GATE (blocking): no valid signature from cosign.pub = the job stops here
+        # and nothing is deployed.
+        run: |
+          cosign verify --key cosign.pub "$APP_IMAGE@$DIGEST" | jq .
+          {
+            echo "### Deploy gate: signature verified"
+            echo "- Image: \`$APP_IMAGE@$DIGEST\`"
+            echo "- Key: \`cosign.pub\` from the repository"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Negative test, the deploy gate refuses an unsigned image
+        # The unsigned upstream image must be refused for the RIGHT reason
+        # ("no signatures found"), otherwise the gate proves nothing.
+        run: |
+          if out=$(cosign verify --key cosign.pub docker.io/bkimminich/juice-shop:latest 2>&1); then
+            echo "$out"
+            echo "::error::The deploy gate accepted an image that we did not sign"
+            exit 1
+          fi
+          echo "$out"
+          if ! grep -q "no signatures found" <<< "$out"; then
+            echo "::error::Verification failed for an unexpected reason (see the output above)"
+            exit 1
+          fi
+          echo "As expected: the unsigned image was refused, it would never be deployed."
+          echo "- Unsigned image \`bkimminich/juice-shop\`: refused by the deploy gate" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create the staging cluster (kind, inside this runner only)
+        run: |
+          kind create cluster --name "$CLUSTER" --image "$KIND_NODE_IMAGE" --wait 120s
+          kubectl cluster-info
+          kubectl get nodes -o wide
+
+      - name: Deploy the verified image by digest
+        run: |
+          mkdir -p rendered
+          cp ops/k8s/*.yaml rendered/
+          # Replace the default digest with the one verified above (never a tag)
+          sed -E -i "s#ghcr\.io/[^@[:space:]]+/juice-shop@sha256:[0-9a-f]{64}#${APP_IMAGE}@${DIGEST}#g" rendered/deployment.yaml
+          n=$(grep -c "${APP_IMAGE}@${DIGEST}" rendered/deployment.yaml)
+          if [ "$n" -ne 2 ]; then
+            echo "::error::Expected the verified digest in 2 places (init container + app), found $n"
+            exit 1
+          fi
+          kubectl apply -f rendered/namespace.yaml
+          kubectl apply -f rendered/
+          kubectl -n "$NAMESPACE" rollout status deployment/juice-shop --timeout=300s
+          kubectl -n "$NAMESPACE" get pods,svc,networkpolicy -o wide
+          {
+            echo "### Staging deployment"
+            echo "- Cluster: ephemeral kind cluster \`$CLUSTER\` inside the runner"
+            echo "- Deployed: \`$APP_IMAGE@$DIGEST\` (signature verified above)"
+            echo "- Namespace \`$NAMESPACE\`: Pod Security \"restricted\", read-only root filesystem, non-root, no capabilities"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Expose staging on the runner's localhost for ZAP
+        run: |
+          nohup kubectl -n "$NAMESPACE" port-forward svc/juice-shop 3000:3000 \
+            --address 127.0.0.1 > port-forward.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:3000/rest/admin/application-version; then
+              echo "Staging answers on 127.0.0.1:3000 after $((i * 2)) seconds"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Staging is not reachable through port-forward"
+          cat port-forward.log
+          exit 1
+
+      - name: ZAP baseline scan
+        # Report only: -I keeps ZAP from failing on warnings; the gate is the next step.
+        # Exit code 3 means ZAP itself failed, which always fails the job.
+        run: |
+          mkdir -p zap && chmod 777 zap # the ZAP container runs as user "zap"
+          set +e
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk" "$ZAP_IMAGE" \
+            zap-baseline.py -t http://127.0.0.1:3000 \
+            -r zap-report.html -J zap-report.json -w zap-report.md -I
+          code=$?
+          set -e
+          echo "ZAP exit code: $code"
+          if [ "$code" -eq 3 ]; then
+            echo "::error::ZAP failed to run the scan"
+            exit 1
+          fi
+          {
+            echo "### ZAP baseline scan against staging (exit code $code)"
+            cat zap/zap-report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: ZAP gate (new alerts of risk Medium or higher)
+        # GATE (blocking): any Medium/High alert whose plugin ID is not accepted in
+        # .zap/accepted-alerts.tsv (or whose acceptance has expired) fails the build.
+        run: |
+          report=zap/zap-report.json
+          accepted_file=.zap/accepted-alerts.tsv
+          today=$(date -u +%F)
+          # Plugin IDs whose acceptance has not expired
+          accepted=$(tr -d '\r' < "$accepted_file" | grep -vE '^[[:space:]]*(#|$)' \
+            | awk -F'\t' -v today="$today" '$3 >= today { print $1 }')
+          echo "Accepted (not expired): ${accepted:-none}"
+          blocking=$(jq -r --arg acc "$accepted" '
+            ($acc | split("\n")) as $ok
+            | [.site[].alerts[]
+               | select((.riskcode | tonumber) >= 2)
+               | select(.pluginid as $p | ($ok | index($p)) | not)
+               | "\(.pluginid)  \(.riskdesc)  \(.name)"]
+            | unique | .[]' "$report")
+          if [ -n "$blocking" ]; then
+            echo "::error::New ZAP alerts of risk Medium or higher:"
+            echo "$blocking"
+            exit 1
+          fi
+          echo "No new Medium or higher ZAP alert."
+
+      - name: Collect cluster evidence on failure
+        if: failure()
+        run: |
+          mkdir -p k8s-evidence
+          kubectl get all,events,networkpolicy -n "$NAMESPACE" -o wide > k8s-evidence/get.txt 2>&1 || true
+          kubectl describe pods -n "$NAMESPACE" > k8s-evidence/describe-pods.txt 2>&1 || true
+          kubectl logs -n "$NAMESPACE" deployment/juice-shop --all-containers > k8s-evidence/logs.txt 2>&1 || true
+          cp port-forward.log k8s-evidence/ 2>/dev/null || true
+
+      - name: Keep the cluster evidence as an artifact
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: k8s-evidence
+          path: k8s-evidence/
+          retention-days: 30
+
+      - name: Keep the ZAP reports as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zap-reports
+          path: zap/
+          retention-days: 30
+
+      - name: Delete the staging cluster
+        if: always()
+        run: kind delete cluster --name "$CLUSTER" || true
+
+  # ---------------------------------------------------------------------------
+  # Stage 10: notification. Email the team when any job of this run fails, over
+  # SMTP with STARTTLS required (curl, no third-party action). No GitHub token at
+  # all (permissions: {}). Secrets: SMTP_USERNAME, SMTP_PASSWORD (an app password),
+  # NOTIFY_EMAIL_TO (comma-separated), so the addresses stay out of this public repo.
+  # ---------------------------------------------------------------------------
+  notify:
+    name: Notify on failure (email)
+    needs: [secrets, sast_semgrep, sast_codeql, sast_sonarqube, sca, iac_scan, build, unit_tests, security_tests, package, image_scan, sbom, publish, sign, deploy_staging]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Send failure email
+        env:
+          SMTP_SERVER: smtp.gmail.com:587
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+          NEEDS: ${{ toJSON(needs) }}
+          WORKFLOW: ${{ github.workflow }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.head_ref || github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$SMTP_USERNAME" ] || [ -z "$SMTP_PASSWORD" ] || [ -z "$NOTIFY_EMAIL_TO" ]; then
+            echo "::warning::Email secrets are not set: no notification sent"
+            exit 0
+          fi
+          # Jobs of this run that failed (from the needs context)
+          failed=$(jq -r 'to_entries[] | select(.value.result == "failure") | "  - " + .key' <<< "$NEEDS")
+          # Single-line values only, so nothing can be injected into the mail headers
+          ref=$(printf '%s' "$REF_NAME" | tr -d '\r\n')
+          title=$(printf '%s' "$PR_TITLE" | tr -d '\r\n')
+          {
+            echo "From: DevSecOps pipeline <$SMTP_USERNAME>"
+            echo "To: $NOTIFY_EMAIL_TO"
+            echo "Subject: [FAILED] $WORKFLOW on $ref"
+            echo "Date: $(date -R)"
+            echo "MIME-Version: 1.0"
+            echo "Content-Type: text/plain; charset=UTF-8"
+            echo
+            echo "The \"$WORKFLOW\" pipeline failed."
+            echo
+            echo "Repository: $REPOSITORY"
+            echo "Branch:     $ref"
+            [ -n "$title" ] && echo "Pull request: $title"
+            echo "Event:      $EVENT, by $ACTOR"
+            echo "Commit:     $SHA"
+            echo
+            echo "Failed job(s):"
+            echo "$failed"
+            echo
+            echo "Logs and reports: $RUN_URL"
+          } > mail.txt
+          # One --mail-rcpt per address in NOTIFY_EMAIL_TO (comma-separated)
+          rcpt=()
+          count=0
+          IFS=',' read -ra addrs <<< "$NOTIFY_EMAIL_TO"
+          for a in "${addrs[@]}"; do
+            a=$(printf '%s' "$a" | tr -d '[:space:]')
+            if [ -n "$a" ]; then
+              rcpt+=(--mail-rcpt "$a")
+              count=$((count + 1))
+            fi
+          done
+          # SMTP with STARTTLS required: the password is never sent in clear text
+          curl --silent --show-error --ssl-reqd \
+            --url "smtp://$SMTP_SERVER" \
+            --user "$SMTP_USERNAME:$SMTP_PASSWORD" \
+            --mail-from "$SMTP_USERNAME" "${rcpt[@]}" \
+            --upload-file mail.txt
+          echo "Failure email sent to $count recipient(s)."

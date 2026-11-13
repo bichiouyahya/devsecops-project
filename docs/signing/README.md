@@ -1,7 +1,7 @@
 # Image signing with Cosign
 
-Task 5 (Person B). Produced by the `sign` job in
-`.github/workflows/build-security.yml`, which runs after the `image` job on
+Task 5 (Person B). Produced by the `sign` job (stage 8) of
+`.github/workflows/devsecops.yml`, which runs after the `publish` job on
 every pull request and push to `main`.
 
 ## Why sign the image
@@ -30,7 +30,7 @@ Pipeline steps:
    against the published checksum file.
 2. **Check that the secrets exist**, with a clear error if they do not.
 3. **Sign by digest**: `cosign sign --key env://COSIGN_PRIVATE_KEY <image>@sha256:...`.
-   The digest comes from the `image` job. We sign the digest, not the tag,
+   The digest comes from the `publish` job. We sign the digest, not the tag,
    because a tag can be moved to another image while a digest is the hash of
    the content. The key is read from an environment variable (`env://`), so it
    is never written to the runner's disk.
