@@ -1,6 +1,6 @@
 # Accepted CRITICAL vulnerabilities (Trivy baseline), Person B quality gate.
 #
-# The sca and image jobs fail on any CRITICAL vulnerability that has a fix
+# The SCA (stage 2) and image scan (stage 6) jobs fail on any CRITICAL vulnerability that has a fix
 # available, EXCEPT the ones listed here. Every entry is a reviewed decision:
 #   - why it is accepted, and who approved it (the pull request that added it)
 #   - an expiry date (exp:): after that date Trivy reports it again and the
