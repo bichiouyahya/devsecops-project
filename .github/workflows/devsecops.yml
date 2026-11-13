@@ -1043,7 +1043,10 @@ jobs:
         # Report only: -I keeps ZAP from failing on warnings; the gate is the next step.
         # Exit code 3 means ZAP itself failed, which always fails the job.
         run: |
-          mkdir -p zap && chmod 777 zap # the ZAP container runs as user "zap"
+          # The ZAP container runs as its own user "zap": give that user (and only
+          # that user) the report folder, instead of making it writable by everyone.
+          zap_uid=$(docker run --rm --entrypoint id "$ZAP_IMAGE" -u)
+          mkdir -p zap && sudo chown "$zap_uid" zap
           set +e
           docker run --rm --network host -v "$PWD/zap:/zap/wrk" "$ZAP_IMAGE" \
             zap-baseline.py -t http://127.0.0.1:3000 \
