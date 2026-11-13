@@ -1,9 +1,12 @@
 # Container build and image scan
 
-Task 4 (Person B). Produced by the `image` job in
-`.github/workflows/build-security.yml` on every pull request and push to `main`.
+Task 4 (Person B). Produced by three jobs of `.github/workflows/devsecops.yml`
+on every pull request and push to `main`: `package` (stage 5, build),
+`image_scan` (stage 6, scan and gate) and `publish` (stage 7, push). The
+package stage passes the image to the next two as a one-day artifact, so the
+image that is scanned is exactly the image that is published.
 
-## What the job does
+## What the stages do
 
 1. **Build** the Juice Shop image from the repository Dockerfile, tagged with
    the commit SHA (`ghcr.io/bichiouyahya/devsecops-project/juice-shop:<sha>`).

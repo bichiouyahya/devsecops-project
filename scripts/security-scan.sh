@@ -20,7 +20,7 @@
 #
 # Requirements (same versions as the pipeline, a warning is shown otherwise):
 #   gitleaks 8.30.1, semgrep 1.183.0 (pipx install semgrep==1.183.0),
-#   docker (Trivy runs from the image pinned by digest in build-security.yml),
+#   docker (Trivy runs from the image pinned by digest in devsecops.yml),
 #   npm (to generate the lockfiles Trivy needs, without installing anything).
 # Works on Linux, macOS and Git Bash on Windows. Run `git fetch` first so the
 # base branch is up to date.
