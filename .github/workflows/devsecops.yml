@@ -800,29 +800,33 @@ jobs:
           name: image
           path: ${{ runner.temp }}
 
-      - name: Load the scanned image
-        run: |
-          docker load -i "$RUNNER_TEMP/image.tar"
-          docker image ls "$APP_IMAGE"
-
-      - name: Push the image to GHCR
+      - name: Push the scanned image to GHCR (skopeo, straight from the tar file)
+        # skopeo copies the exact tar file that Trivy scanned and Syft inventoried
+        # to the registry. It does not go through the local Docker image store
+        # (docker load + docker push fails there with "unknown blob").
+        # skopeo is preinstalled on the GitHub Ubuntu runners.
         id: push
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
         run: |
-          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-          docker push "$APP_IMAGE:$GITHUB_SHA"
+          skopeo --version
+          echo "$GHCR_TOKEN" | skopeo login ghcr.io --username "$GHCR_USER" --password-stdin
+          skopeo copy --digestfile "$RUNNER_TEMP/digest.txt" \
+            "docker-archive:$RUNNER_TEMP/image.tar" "docker://$APP_IMAGE:$GITHUB_SHA"
+          skopeo logout ghcr.io
           # The digest identifies the exact image content; the sign stage signs this, not the tag
-          ref=$(docker inspect --format='{{index .RepoDigests 0}}' "$APP_IMAGE:$GITHUB_SHA")
-          digest="${ref#*@}"
+          digest=$(cat "$RUNNER_TEMP/digest.txt")
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected digest from skopeo: $digest"
+            exit 1
+          fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           {
             echo "### Image published"
             echo "- Tag: \`$APP_IMAGE:$GITHUB_SHA\`"
             echo "- Digest: \`$digest\`"
           } >> "$GITHUB_STEP_SUMMARY"
-          docker logout ghcr.io
 
   # ---------------------------------------------------------------------------
   # Stage 8: sign. Cosign signs the DIGEST (the content hash), never the tag,
