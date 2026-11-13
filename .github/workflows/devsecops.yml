@@ -58,7 +58,6 @@ concurrency:
 
 env:
   GITLEAKS_VERSION: 8.30.1
-  SEMGREP_VERSION: 1.183.0
   HADOLINT_IMAGE: hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
   CHECKOV_IMAGE: bridgecrew/checkov:3.3.29@sha256:3cc125b5337717b7303dbddd4e79374c120687b5ff6a24f9abdad56b562469f3
   TRIVY_IMAGE: aquasec/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222
@@ -152,7 +151,7 @@ jobs:
 
       - name: Install Semgrep (pinned version)
         run: |
-          pipx install "semgrep==${SEMGREP_VERSION}"
+          pipx install semgrep==1.183.0
           semgrep --version
 
       - name: Scan source code (full report)
@@ -299,6 +298,18 @@ jobs:
           cd frontend
           npm install --package-lock-only --package-lock=true \
             --ignore-scripts --no-audit --no-fund --legacy-peer-deps
+
+      - name: Keep the resolved lockfiles for the next stages
+        # The build and test stages install from THESE lockfiles (npm ci) and the
+        # SBOM stage inventories them, so every stage works on exactly the
+        # dependency versions scanned below.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lockfile
+          path: |
+            package-lock.json
+            frontend/package-lock.json
+          retention-days: 1
 
       - name: Trivy filesystem scan (HIGH, CRITICAL)
         # Report only. --ignorefile /dev/null: the reports show EVERY finding,
@@ -456,18 +467,26 @@ jobs:
         with:
           node-version: 24
 
-      - name: Install dependencies (no install scripts)
-        # No lockfile in Juice Shop, so npm install (not npm ci). --ignore-scripts:
-        # third-party install scripts never run, and the postinstall Angular build
-        # (which crashes npm on GitHub runners) is skipped; the frontend is
-        # compiled inside the Docker build of the package stage.
+      - name: Get the lockfile resolved and scanned by the SCA stage
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lockfile
+          path: .
+
+      - name: Install the exact scanned dependencies (npm ci, no install scripts)
+        # npm ci installs exactly the versions of the lockfile that Trivy scanned
+        # in stage 2, and fails if package.json and the lockfile disagree.
+        # --ignore-scripts: third-party install scripts never run, and the
+        # postinstall Angular build (which crashes npm on GitHub runners) is
+        # skipped; the frontend is compiled inside the Docker build (stage 5).
+        # sqlite3 is then rebuilt on its own: it needs its native binary.
         run: |
-          npm install --no-audit --no-fund --ignore-scripts
+          npm ci --package-lock=true --ignore-scripts --no-audit --no-fund
           npm rebuild sqlite3
 
       - name: Compile the server (tsc)
         # GATE (blocking): a compile error stops the pipeline here.
-        run: npx tsc
+        run: ./node_modules/.bin/tsc
 
       - name: Keep the compiled server as an artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -498,13 +517,21 @@ jobs:
         with:
           node-version: 24
 
-      - name: Install dependencies (no install scripts)
-        # No lockfile in Juice Shop, so npm install (not npm ci). --ignore-scripts:
-        # third-party install scripts never run, and the postinstall Angular build
-        # (which crashes npm on GitHub runners) is skipped; the frontend is
-        # compiled inside the Docker build of the package stage.
+      - name: Get the lockfile resolved and scanned by the SCA stage
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lockfile
+          path: .
+
+      - name: Install the exact scanned dependencies (npm ci, no install scripts)
+        # npm ci installs exactly the versions of the lockfile that Trivy scanned
+        # in stage 2, and fails if package.json and the lockfile disagree.
+        # --ignore-scripts: third-party install scripts never run, and the
+        # postinstall Angular build (which crashes npm on GitHub runners) is
+        # skipped; the frontend is compiled inside the Docker build (stage 5).
+        # sqlite3 is then rebuilt on its own: it needs its native binary.
         run: |
-          npm install --no-audit --no-fund --ignore-scripts
+          npm ci --package-lock=true --ignore-scripts --no-audit --no-fund
           npm rebuild sqlite3
 
       - name: Run the server unit tests
@@ -542,17 +569,25 @@ jobs:
         with:
           node-version: 24
 
-      - name: Install dependencies (no install scripts)
-        # No lockfile in Juice Shop, so npm install (not npm ci). --ignore-scripts:
-        # third-party install scripts never run, and the postinstall Angular build
-        # (which crashes npm on GitHub runners) is skipped; the frontend is
-        # compiled inside the Docker build of the package stage.
+      - name: Get the lockfile resolved and scanned by the SCA stage
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lockfile
+          path: .
+
+      - name: Install the exact scanned dependencies (npm ci, no install scripts)
+        # npm ci installs exactly the versions of the lockfile that Trivy scanned
+        # in stage 2, and fails if package.json and the lockfile disagree.
+        # --ignore-scripts: third-party install scripts never run, and the
+        # postinstall Angular build (which crashes npm on GitHub runners) is
+        # skipped; the frontend is compiled inside the Docker build (stage 5).
+        # sqlite3 is then rebuilt on its own: it needs its native binary.
         run: |
-          npm install --no-audit --no-fund --ignore-scripts
+          npm ci --package-lock=true --ignore-scripts --no-audit --no-fund
           npm rebuild sqlite3
 
       - name: Build server
-        run: npx tsc
+        run: ./node_modules/.bin/tsc
 
       - name: Create placeholder frontend files
         # The server checks at startup that these files exist. API tests never load them.
@@ -623,8 +658,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # Stage 6: release checks, in parallel. Trivy scans the image (it adds OS
   # packages and layers the source scan cannot see). Syft writes the SBOM of the
-  # release from the resolved dependency tree of the same commit. Juice Shop ships
-  # WITHOUT a lockfile, so the tree is resolved first (no install, no scripts).
+  # release from the lockfiles resolved and scanned in stage 2 (same commit).
   # ---------------------------------------------------------------------------
   image_scan:
     name: Image scan (Trivy)
@@ -709,18 +743,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Node.js
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - name: Get the lockfiles resolved and scanned by the SCA stage
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          node-version: 24
-
-      - name: Resolve dependency tree (generate lockfiles, no install)
-        run: |
-          npm install --package-lock-only --package-lock=true \
-            --ignore-scripts --no-audit --no-fund
-          cd frontend
-          npm install --package-lock-only --package-lock=true \
-            --ignore-scripts --no-audit --no-fund --legacy-peer-deps
+          name: lockfile
+          path: .
 
       - name: Generate SBOM with Syft
         run: |
