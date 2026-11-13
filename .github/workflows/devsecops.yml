@@ -14,6 +14,8 @@
 #   8 Sign           Cosign signature of the image digest, then verification
 #   9 Deploy + DAST  signature checked again at deploy time, deployment to an
 #                    ephemeral Kubernetes staging (kind), OWASP ZAP scan
+#     Cleanup        on main only: old images deleted from GHCR, only the
+#                    image just deployed (and its signature) is kept
 #  10 Notify         email to the team if any job failed
 #
 # Quality gates. Every scan first writes its full report (Security tab +
@@ -1122,6 +1124,73 @@ jobs:
         run: kind delete cluster --name "$CLUSTER" || true
 
   # ---------------------------------------------------------------------------
+  # Registry cleanup, on main only: once the new image is published, signed and
+  # deployed, delete the images of previous runs from GHCR so that the registry
+  # holds only the image currently deployed (plus its Cosign signature).
+  # Kept: the version whose digest was just published, the versions tagged with
+  # this commit or with its signature tag (sha256-<digest>), and anything pushed
+  # after this run started (for example by a pull request running right now).
+  # Uses the GitHub API with the job's own token (packages: write); no
+  # third-party action.
+  # ---------------------------------------------------------------------------
+  cleanup_registry:
+    name: Cleanup old images (GHCR)
+    needs: [publish, deploy_staging]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read     # read when this run started
+      packages: write   # delete old versions of our image
+    steps:
+      - name: Delete the images of previous runs, keep the one just deployed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          if ! [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::No valid digest from the publish stage, nothing deleted"
+            exit 1
+          fi
+          pkg="${REPO#*/}/juice-shop"
+          pkg_enc="${pkg//\//%2F}"
+          if [ "$(gh api "/users/$OWNER" --jq .type)" = "Organization" ]; then
+            base="/orgs/$OWNER/packages/container/$pkg_enc/versions"
+          else
+            base="/users/$OWNER/packages/container/$pkg_enc/versions"
+          fi
+          started=$(gh api "/repos/$REPO/actions/runs/$RUN_ID" --jq .run_started_at)
+          sig_tag="sha256-${DIGEST#sha256:}"
+          echo "Keeping $DIGEST (commit $GITHUB_SHA) and everything created after $started"
+
+          # One line per version: id, digest, created_at, tags (comma-separated)
+          gh api --paginate "$base" \
+            --jq '.[] | [(.id | tostring), .name, .created_at, (.metadata.container.tags | join(","))] | @tsv' \
+            > versions.tsv
+          echo "Versions in GHCR: $(wc -l < versions.tsv)"
+          grep -q "$DIGEST" versions.tsv || { echo "::error::The deployed image is not in the list, nothing deleted"; exit 1; }
+
+          deleted=0
+          while IFS=$'\t' read -r id name created tags; do
+            if [ "$name" = "$DIGEST" ] || [[ ",$tags," == *",$GITHUB_SHA,"* ]] \
+               || [[ ",$tags," == *",$sig_tag"* ]] || [[ "$created" > "$started" ]]; then
+              echo "keep    $id  $name  [$tags]"
+              continue
+            fi
+            echo "delete  $id  $name  [$tags]"
+            gh api --method DELETE "$base/$id"
+            deleted=$((deleted + 1))
+          done < versions.tsv
+          {
+            echo "### Registry cleanup"
+            echo "- Kept: \`$APP_IMAGE@$DIGEST\` (deployed) and its signature"
+            echo "- Deleted: $deleted old version(s)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
   # Stage 10: notification. Email the team when any job of this run fails, over
   # SMTP with STARTTLS required (curl, no third-party action). No GitHub token at
   # all (permissions: {}). Secrets: SMTP_USERNAME, SMTP_PASSWORD (an app password),
@@ -1129,7 +1198,7 @@ jobs:
   # ---------------------------------------------------------------------------
   notify:
     name: Notify on failure (email)
-    needs: [secrets, sast_semgrep, sast_codeql, sast_sonarqube, sca, iac_scan, build, unit_tests, security_tests, package, image_scan, sbom, publish, sign, deploy_staging]
+    needs: [secrets, sast_semgrep, sast_codeql, sast_sonarqube, sca, iac_scan, build, unit_tests, security_tests, package, image_scan, sbom, publish, sign, deploy_staging, cleanup_registry]
     if: failure()
     runs-on: ubuntu-latest
     timeout-minutes: 5
