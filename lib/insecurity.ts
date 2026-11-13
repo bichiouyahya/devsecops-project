@@ -49,10 +49,31 @@ export const cutOffPoisonNullByte = (str: string) => {
   return str
 }
 
-export const isAuthorized = () => expressJwt(({ secret: publicKey }) as any)
+// FIX (DevSecOps Task 7): verify JWT signatures with a fixed algorithm (RS256).
+// The old express-jwt / jsonwebtoken / jws versions read the algorithm from the token header,
+// so a token announcing alg "none" with no signature was accepted. We only ever sign with RS256,
+// so tokens are now verified with RS256 directly and the header's "alg" claim is never trusted.
+export const hasValidSignature = (token: string): boolean => {
+  const [header, payload, signature] = String(token).split('.')
+  try {
+    return crypto.verify('RSA-SHA256', Buffer.from(`${header}.${payload}`), publicKey, Buffer.from(signature ?? '', 'base64url'))
+  } catch {
+    return false
+  }
+}
+
+export const isAuthorized = () => {
+  const checkClaims = expressJwt(({ secret: publicKey }) as any)
+  return (req: Request, res: Response, next: NextFunction) => {
+    const signatureValid = hasValidSignature(utils.jwtFrom(req) ?? '')
+    checkClaims(req, res, (err?: any) => {
+      next(err ?? (signatureValid ? undefined : Object.assign(new Error('Invalid token signature'), { name: 'UnauthorizedError', code: 'invalid_token', status: 401 })))
+    })
+  }
+}
 export const denyAll = () => expressJwt({ secret: '' + Math.random() } as any)
 export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256' })
-export const verify = (token: string) => token ? (jws.verify as ((token: string, secret: string) => boolean))(token, publicKey) : false
+export const verify = (token: string) => hasValidSignature(token)
 export const decode = (token: string) => { return jws.decode(token)?.payload }
 
 export const sanitizeHtml = (html: string) => sanitizeHtmlLib(html)

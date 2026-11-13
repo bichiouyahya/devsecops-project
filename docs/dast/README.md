@@ -1,14 +1,15 @@
 # DAST with OWASP ZAP
 
-Task 6 (Person B). Produced by the `dast` job in
-`.github/workflows/build-security.yml`, which runs after `image` and `sign`.
+Task 6 (Person B). Produced by the `deploy_staging` job (stage 9) of
+`.github/workflows/devsecops.yml`, which runs after `publish` and `sign`.
 
 ## How the scan runs
 
 1. The job pulls the image built and **signed** in the same run, by digest, so
    the scan targets exactly the artifact we would deploy.
-2. It starts Juice Shop on `127.0.0.1:3000` inside the CI runner and waits
-   until the application answers.
+2. It deploys the image to an ephemeral Kubernetes staging cluster (kind)
+   inside the CI runner, exposes it on `127.0.0.1:3000` with
+   `kubectl port-forward`, and waits until the application answers.
 3. It runs the **ZAP 2.17.0 baseline scan** (`zap-baseline.py`): ZAP spiders
    the application for one minute and passively inspects every response
    (headers, cookies, page content). Baseline mode sends no attack payloads,
