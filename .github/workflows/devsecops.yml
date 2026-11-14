@@ -1,4 +1,4 @@
-# DevSecOps pipeline for OWASP Juice Shop: one workflow, ten stages.
+# DevSecOps pipeline for OWASP Juice Shop: one workflow, eleven stages.
 #
 # Each stage starts only when every job of the previous stage has passed
 # (`needs`), so the graph of a run reads left to right like the pipeline:
@@ -12,11 +12,13 @@
 #   6 Release checks Trivy image scan, SBOM (Syft, CycloneDX)
 #   7 Publish        push the scanned image to GHCR
 #   8 Sign           Cosign signature of the image digest, then verification
-#   9 Deploy + DAST  signature checked again at deploy time, deployment to an
-#                    ephemeral Kubernetes staging (kind), OWASP ZAP scan
+#   9 DAST           OWASP ZAP attacks the signed image, run in an isolated
+#                    test container, BEFORE any deployment
+#  10 Deploy staging signature checked again at deploy time, deployment to an
+#                    ephemeral Kubernetes staging (kind), smoke test
 #     Cleanup        on main only: old images deleted from GHCR, only the
 #                    image just deployed (and its signature) is kept
-#  10 Notify         email to the team if any job failed
+#  11 Notify         email to the team if any job failed
 #
 # Quality gates. Every scan first writes its full report (Security tab +
 # artifact); a separate step marked "GATE (blocking)" then decides whether the
@@ -924,17 +926,129 @@ jobs:
         run: docker logout ghcr.io
 
   # ---------------------------------------------------------------------------
-  # Stage 9: deploy to staging, then DAST. An ephemeral Kubernetes cluster (kind)
-  # is created INSIDE the GitHub-hosted runner and deleted at the end of the job:
-  # nothing is public, nothing runs on our PCs, no self-hosted runner.
+  # ---------------------------------------------------------------------------
+  # Stage 9: DAST, on its own, BEFORE any deployment. The signed image is pulled
+  # by digest and started in an isolated test container inside this runner
+  # (bound to 127.0.0.1 only, non-root, no Linux capabilities), then OWASP ZAP
+  # attacks it over HTTP. A new alert of risk Medium or higher stops the
+  # pipeline here: the image is never deployed.
+  # ---------------------------------------------------------------------------
+  dast:
+    name: DAST (OWASP ZAP)
+    needs: [publish, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read # pull our image from GHCR
+    env:
+      DIGEST: ${{ needs.publish.outputs.digest }}
+    steps:
+      - name: Checkout (ZAP accepted alerts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pull the signed image by digest
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          docker pull "$APP_IMAGE@$DIGEST"
+          docker logout ghcr.io
+
+      - name: Start the application in an isolated test container
+        # Reachable only from this runner (127.0.0.1), runs as the image's
+        # non-root user, without Linux capabilities or privilege escalation.
+        run: |
+          docker run -d --name juice -p 127.0.0.1:3000:3000 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            "$APP_IMAGE@$DIGEST"
+          for i in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:3000/rest/admin/application-version; then
+              echo "The application answers on 127.0.0.1:3000 after $((i * 2)) seconds"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::The application did not start within 2 minutes"
+          docker logs juice
+          exit 1
+
+      - name: ZAP baseline scan
+        # Report only: -I keeps ZAP from failing on warnings; the gate is the next step.
+        # Exit code 3 means ZAP itself failed, which always fails the job.
+        run: |
+          # The ZAP container runs as its own user "zap": give that user (and only
+          # that user) the report folder, instead of making it writable by everyone.
+          zap_uid=$(docker run --rm --entrypoint id "$ZAP_IMAGE" -u)
+          mkdir -p zap && sudo chown "$zap_uid" zap
+          set +e
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk" "$ZAP_IMAGE" \
+            zap-baseline.py -t http://127.0.0.1:3000 \
+            -r zap-report.html -J zap-report.json -w zap-report.md -I
+          code=$?
+          set -e
+          echo "ZAP exit code: $code"
+          if [ "$code" -eq 3 ]; then
+            echo "::error::ZAP failed to run the scan"
+            exit 1
+          fi
+          {
+            echo "### ZAP baseline scan (exit code $code)"
+            cat zap/zap-report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: ZAP gate (new alerts of risk Medium or higher)
+        # GATE (blocking): any Medium/High alert whose plugin ID is not accepted in
+        # .zap/accepted-alerts.tsv (or whose acceptance has expired) fails the build.
+        run: |
+          report=zap/zap-report.json
+          accepted_file=.zap/accepted-alerts.tsv
+          today=$(date -u +%F)
+          # Plugin IDs whose acceptance has not expired
+          accepted=$(tr -d '\r' < "$accepted_file" | grep -vE '^[[:space:]]*(#|$)' \
+            | awk -F'\t' -v today="$today" '$3 >= today { print $1 }')
+          echo "Accepted (not expired): ${accepted:-none}"
+          blocking=$(jq -r --arg acc "$accepted" '
+            ($acc | split("\n")) as $ok
+            | [.site[].alerts[]
+               | select((.riskcode | tonumber) >= 2)
+               | select(.pluginid as $p | ($ok | index($p)) | not)
+               | "\(.pluginid)  \(.riskdesc)  \(.name)"]
+            | unique | .[]' "$report")
+          if [ -n "$blocking" ]; then
+            echo "::error::New ZAP alerts of risk Medium or higher:"
+            echo "$blocking"
+            exit 1
+          fi
+          echo "No new Medium or higher ZAP alert."
+
+      - name: Stop the test container
+        if: always()
+        run: docker rm -f juice || true
+
+      - name: Keep the ZAP reports as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zap-reports
+          path: zap/
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Stage 10: deploy to staging, only after DAST passed. An ephemeral Kubernetes
+  # cluster (kind) is created INSIDE the GitHub-hosted runner and deleted at the
+  # end of the job: nothing is public, nothing runs on our PCs.
   # 1. Deploy gate: cosign verify of the digest BEFORE any kubectl apply.
   # 2. Negative test: the same gate must refuse the unsigned upstream image.
   # 3. Deploy the hardened manifests of ops/k8s/ by DIGEST, wait for the rollout.
-  # 4. DAST: OWASP ZAP baseline against the deployed Service (port-forward).
+  # 4. Smoke test: the deployed Service answers.
   # ---------------------------------------------------------------------------
   deploy_staging:
-    name: Deploy staging + DAST (kind, ZAP)
-    needs: [publish, sign]
+    name: Deploy staging (kind)
+    needs: [publish, sign, dast]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -950,7 +1064,7 @@ jobs:
       NAMESPACE: juice-shop-staging
       DIGEST: ${{ needs.publish.outputs.digest }}
     steps:
-      - name: Checkout (manifests, cosign.pub, ZAP accepted alerts)
+      - name: Checkout (manifests, cosign.pub)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -1030,13 +1144,14 @@ jobs:
             echo "- Namespace \`$NAMESPACE\`: Pod Security \"restricted\", read-only root filesystem, non-root, no capabilities"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Expose staging on the runner's localhost for ZAP
+      - name: Smoke test, the deployed Service answers
         run: |
           nohup kubectl -n "$NAMESPACE" port-forward svc/juice-shop 3000:3000 \
             --address 127.0.0.1 > port-forward.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -fsS -o /dev/null http://127.0.0.1:3000/rest/admin/application-version; then
               echo "Staging answers on 127.0.0.1:3000 after $((i * 2)) seconds"
+              echo "- Smoke test: the deployed Service answers" >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
             sleep 2
@@ -1044,55 +1159,6 @@ jobs:
           echo "::error::Staging is not reachable through port-forward"
           cat port-forward.log
           exit 1
-
-      - name: ZAP baseline scan
-        # Report only: -I keeps ZAP from failing on warnings; the gate is the next step.
-        # Exit code 3 means ZAP itself failed, which always fails the job.
-        run: |
-          # The ZAP container runs as its own user "zap": give that user (and only
-          # that user) the report folder, instead of making it writable by everyone.
-          zap_uid=$(docker run --rm --entrypoint id "$ZAP_IMAGE" -u)
-          mkdir -p zap && sudo chown "$zap_uid" zap
-          set +e
-          docker run --rm --network host -v "$PWD/zap:/zap/wrk" "$ZAP_IMAGE" \
-            zap-baseline.py -t http://127.0.0.1:3000 \
-            -r zap-report.html -J zap-report.json -w zap-report.md -I
-          code=$?
-          set -e
-          echo "ZAP exit code: $code"
-          if [ "$code" -eq 3 ]; then
-            echo "::error::ZAP failed to run the scan"
-            exit 1
-          fi
-          {
-            echo "### ZAP baseline scan against staging (exit code $code)"
-            cat zap/zap-report.md
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: ZAP gate (new alerts of risk Medium or higher)
-        # GATE (blocking): any Medium/High alert whose plugin ID is not accepted in
-        # .zap/accepted-alerts.tsv (or whose acceptance has expired) fails the build.
-        run: |
-          report=zap/zap-report.json
-          accepted_file=.zap/accepted-alerts.tsv
-          today=$(date -u +%F)
-          # Plugin IDs whose acceptance has not expired
-          accepted=$(tr -d '\r' < "$accepted_file" | grep -vE '^[[:space:]]*(#|$)' \
-            | awk -F'\t' -v today="$today" '$3 >= today { print $1 }')
-          echo "Accepted (not expired): ${accepted:-none}"
-          blocking=$(jq -r --arg acc "$accepted" '
-            ($acc | split("\n")) as $ok
-            | [.site[].alerts[]
-               | select((.riskcode | tonumber) >= 2)
-               | select(.pluginid as $p | ($ok | index($p)) | not)
-               | "\(.pluginid)  \(.riskdesc)  \(.name)"]
-            | unique | .[]' "$report")
-          if [ -n "$blocking" ]; then
-            echo "::error::New ZAP alerts of risk Medium or higher:"
-            echo "$blocking"
-            exit 1
-          fi
-          echo "No new Medium or higher ZAP alert."
 
       - name: Collect cluster evidence on failure
         if: failure()
@@ -1109,14 +1175,6 @@ jobs:
         with:
           name: k8s-evidence
           path: k8s-evidence/
-          retention-days: 30
-
-      - name: Keep the ZAP reports as an artifact
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: zap-reports
-          path: zap/
           retention-days: 30
 
       - name: Delete the staging cluster
@@ -1191,14 +1249,14 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # Stage 10: notification. Email the team when any job of this run fails, over
+  # Stage 11: notification. Email the team when any job of this run fails, over
   # SMTP with STARTTLS required (curl, no third-party action). No GitHub token at
   # all (permissions: {}). Secrets: SMTP_USERNAME, SMTP_PASSWORD (an app password),
   # NOTIFY_EMAIL_TO (comma-separated), so the addresses stay out of this public repo.
   # ---------------------------------------------------------------------------
   notify:
     name: Notify on failure (email)
-    needs: [secrets, sast_semgrep, sast_codeql, sast_sonarqube, sca, iac_scan, build, unit_tests, security_tests, package, image_scan, sbom, publish, sign, deploy_staging, cleanup_registry]
+    needs: [secrets, sast_semgrep, sast_codeql, sast_sonarqube, sca, iac_scan, build, unit_tests, security_tests, package, image_scan, sbom, publish, sign, dast, deploy_staging, cleanup_registry]
     if: failure()
     runs-on: ubuntu-latest
     timeout-minutes: 5
