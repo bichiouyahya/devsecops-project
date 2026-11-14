@@ -1,6 +1,6 @@
 # Accepted ZAP alerts (DAST baseline), Person B quality gate.
 #
-# The ZAP gate of the deploy_staging job fails on any alert of risk Medium or higher (riskcode >= 2)
+# The ZAP gate of the dast job fails on any alert of risk Medium or higher (riskcode >= 2)
 # that is NOT listed here. Low and Informational alerts never block.
 # Every entry is a reviewed decision: reason, approving pull request, and an
 # expiry date (YYYY-MM-DD); after that date the alert blocks again until the
